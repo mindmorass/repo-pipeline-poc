@@ -4,6 +4,151 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added - OpenSSF Scorecard Integration (Dec 19, 2024)
+
+#### 🎯 Unified Security & Governance Scoring
+
+Integrated OpenSSF Scorecard with custom properties compliance to produce a single unified score that includes both security best practices and governance compliance.
+
+**Problem Solved:**
+
+- Security posture (Scorecard) and governance compliance tracked separately
+- No single metric to evaluate repository health holistically
+- Custom properties compliance not weighted as part of overall security score
+- Difficult to enforce minimum standards across both dimensions
+
+**Solution:**
+
+1. **Unified Compliance Workflow**
+
+   - Runs custom properties compliance scan across all repos
+   - Calculates compliance score (0-10) based on violations
+   - Runs OpenSSF Scorecard for security checks
+   - Merges compliance results into Scorecard as custom check
+   - Recalculates aggregate score with compliance included
+
+2. **Compliance Scoring Algorithm**
+
+   ```
+   Starting Score: 10.0
+
+   For each violation:
+     - Critical: -3.0 points
+     - High:     -1.5 points
+     - Medium:   -0.5 points
+     - Low:      -0.2 points
+
+   Minimum: 0.0
+   Bonus: +0.5 for mature governance (3+ optional properties)
+   ```
+
+3. **Risk Weighting**
+
+   - Custom Properties Compliance = **Critical** risk (10x weight)
+   - Same weight as vulnerabilities, branch protection
+   - Reflects importance of governance for automation
+
+4. **SARIF Integration**
+   - Results uploaded to GitHub Security tab
+   - Violations shown with severity levels
+   - Linked to code scanning alerts
+   - Full compliance history tracked
+
+**Architecture:**
+
+```
+┌─────────────────────────────────────────┐
+│  Unified Compliance System              │
+├─────────────────────────────────────────┤
+│  1. Properties Scanner → Score: 7.5/10  │
+│  2. OpenSSF Scorecard  → Score: 8.2/10  │
+│  3. Merge Results (SARIF)               │
+│  4. Unified Score: 7.9/10               │
+└─────────────────────────────────────────┘
+```
+
+**Files Created:**
+
+- `manager_repo/.github/workflows/unified-compliance.yml` - Main workflow (500+ lines)
+- `docs/SCORECARD-INTEGRATION.md` - Complete integration guide
+- `docs/examples/scorecard-badge-setup.md` - Badge configuration examples
+
+**Features:**
+
+✅ **Single Unified Score** - Security + Governance in one metric  
+✅ **GitHub Security Tab** - Full SARIF integration  
+✅ **Automated Issue Creation** - Weekly compliance reports  
+✅ **Score Distribution Tracking** - Org-wide health metrics  
+✅ **Tier-Based Requirements** - Different targets by customer tier  
+✅ **Badge Support** - Display scores in README files  
+✅ **Blocking Capability** - Can enforce minimum scores for deployments
+
+**Usage:**
+
+```bash
+# Run unified compliance scan
+gh workflow run unified-compliance.yml \
+  --repo your-org/manager-repo
+
+# With filters
+gh workflow run unified-compliance.yml \
+  -f repo_filter="customer-.*" \
+  -f severity_filter=high \
+  -f remediate=true
+```
+
+**Output Example:**
+
+```
+Unified Compliance Score: 8.2/10
+
+Component Scores:
+├─ OpenSSF Scorecard:      8.5/10  ✅
+├─ Custom Properties:      7.9/10  ✅
+├─ Total Repos:            142
+└─ Compliant Repos:        128 (90%)
+
+Distribution:
+├─ Excellent (9-10):       68 repos
+├─ Good (7-9):             42 repos
+├─ Fair (5-7):             18 repos
+└─ Poor (0-5):             14 repos
+```
+
+**Benefits:**
+
+- 🎯 Holistic view of repository health
+- 📊 Industry-standard security metrics + org-specific governance
+- 🔍 Unified reporting and enforcement
+- 📈 Track improvements over time across both dimensions
+- 🚨 Block deployments on low scores (optional)
+- 🏷️ Governance treated with same importance as security
+
+**Integration Points:**
+
+1. **Security Tab** - View all violations in one place
+2. **Status Checks** - Can require minimum unified score
+3. **Badges** - Display scores in README files
+4. **Artifacts** - Download detailed JSON/SARIF reports
+5. **Issues** - Automated compliance tracking
+
+**Score Interpretation:**
+
+| Score    | Grade | Meaning   | Action                   |
+| -------- | ----- | --------- | ------------------------ |
+| 9.0-10.0 | A+    | Excellent | Maintain                 |
+| 7.0-8.9  | B     | Good      | Minor improvements       |
+| 5.0-6.9  | C     | Fair      | Significant improvements |
+| 3.0-4.9  | D     | Poor      | Urgent attention         |
+| 0.0-2.9  | F     | Critical  | Immediate remediation    |
+
+**Related:**
+
+- [SCORECARD-INTEGRATION.md](SCORECARD-INTEGRATION.md) - Full documentation
+- [OpenSSF Scorecard](https://github.com/ossf/scorecard) - Official project
+
+---
+
 ### Added - Phase 3 Auto-Remediation (Dec 19, 2024)
 
 #### 🤖 Automatic Content Type Drift Detection & Remediation
@@ -11,6 +156,7 @@ All notable changes to this project are documented here.
 Implemented Phase 3 auto-remediation to handle repository restructuring scenarios (merges, splits, content changes).
 
 **Problem Solved:**
+
 - Repository merges (app + infra → monorepo) leave stale properties
 - Repository splits leave incorrect content types
 - Infrastructure addition/removal not reflected in properties
@@ -19,11 +165,13 @@ Implemented Phase 3 auto-remediation to handle repository restructuring scenario
 **Solution:**
 
 1. **Structure Detection in Compliance Scanner**
+
    - Automatically detects actual repository content
    - Compares with declared `repo_content_type`
    - Identifies mismatches (missing or stale types)
 
 2. **Safe Auto-Remediation**
+
    - ✅ Automatically **adds** missing content types when detected
    - ⚠️ **Suggests** (doesn't auto-remove) stale types for manual review
    - Full audit trail of all fixes
@@ -50,14 +198,17 @@ Implemented Phase 3 auto-remediation to handle repository restructuring scenario
 ```
 
 **Files Created:**
+
 - `source_monorepo/.github/workflows/validate-content-type.yml` - Source validation
 - `docs/AUTO-REMEDIATION.md` - Complete remediation guide
 
 **Files Updated:**
+
 - `manager_repo/.github/compliance/config.json` - Added detection rules
 - `manager_repo/.github/workflows/property-compliance.yml` - Added structure detection
 
 **Benefits:**
+
 - ✅ Automatic drift correction for safe cases
 - ✅ Immediate detection of structure changes
 - ✅ Clear guidance for manual review cases
@@ -65,6 +216,7 @@ Implemented Phase 3 auto-remediation to handle repository restructuring scenario
 - ✅ Full audit trail and reporting
 
 **Example Auto-Fix:**
+
 ```
 Repo: customer-monorepo
 Before: repo_content_type: ["app"]
@@ -81,6 +233,7 @@ After: repo_content_type: ["app", "infra"]  ← Auto-fixed!
 Added `repo_content_type` custom property to classify repositories by their content.
 
 **Property Definition:**
+
 - **Type**: Multi-select
 - **Values**: `app`, `infra`
 - **Purpose**: Identify what content the repository manages
@@ -88,10 +241,12 @@ Added `repo_content_type` custom property to classify repositories by their cont
 **Use Cases:**
 
 1. **Monorepo** (`["app", "infra"]`)
+
    - Contains both application and infrastructure code
    - Example: `source_monorepo/` with `app/` and `infra/` directories
 
 2. **Infrastructure-Only** (`["infra"]`)
+
    - Contains only infrastructure code (Terraform, Ansible, K8s)
    - Example: `terraform-modules/`, `ansible-playbooks/`
 
@@ -152,6 +307,7 @@ Built a complete compliance scanning and drift detection system for GitHub Custo
 **New Components:**
 
 1. **Compliance Scanner Workflow** (`property-compliance.yml`)
+
    - 513 lines - Scans all org repositories every 6 hours
    - Validates properties against configurable rules
    - Detects 7 types of violations (missing, invalid, stale, team mismatches)
@@ -162,6 +318,7 @@ Built a complete compliance scanning and drift detection system for GitHub Custo
    - Fails on critical violations to block deployments
 
 2. **External Sync Tool** (`tools/sync-properties.js`)
+
    - 350 lines - Syncs GitHub properties with external sources of truth
    - Pluggable adapters: Billing System, LDAP/AD, CMDB, GitHub Teams
    - NPM scripts for common operations (`sync:all`, `sync:billing`, `sync:teams`)
@@ -184,15 +341,15 @@ Built a complete compliance scanning and drift detection system for GitHub Custo
 
 **Violation Types Detected:**
 
-| Type | Description | Severity | Auto-Fix? |
-|------|-------------|----------|-----------|
-| `missing_required` | Required property not set | High | No |
-| `invalid_value` | Property has disallowed value | High | No |
-| `invalid_team` | Team doesn't exist in org | Critical | Yes* |
-| `team_mismatch` | Team doesn't have repo access | Medium | No |
-| `stale_property` | Property unchanged for 90+ days | Low | No |
+| Type               | Description                     | Severity | Auto-Fix? |
+| ------------------ | ------------------------------- | -------- | --------- |
+| `missing_required` | Required property not set       | High     | No        |
+| `invalid_value`    | Property has disallowed value   | High     | No        |
+| `invalid_team`     | Team doesn't exist in org       | Critical | Yes\*     |
+| `team_mismatch`    | Team doesn't have repo access   | Medium   | No        |
+| `stale_property`   | Property unchanged for 90+ days | Low      | No        |
 
-*Auto-fix only when `remediate: true` flag set
+\*Auto-fix only when `remediate: true` flag set
 
 **Common Scenarios Solved:**
 
@@ -200,7 +357,7 @@ Built a complete compliance scanning and drift detection system for GitHub Custo
 ✅ **Customer Tier Changes**: Billing webhook triggers sync, properties auto-updated  
 ✅ **Repository Transfers**: GitHub webhook detected, team ownership auto-synced  
 ✅ **New Compliance Requirements**: Add to config, scanner creates issue with all violations  
-✅ **Drift Detection**: Automatic every 6 hours with GitHub Issue tracking  
+✅ **Drift Detection**: Automatic every 6 hours with GitHub Issue tracking
 
 **Usage:**
 
@@ -236,12 +393,14 @@ Added support for GitHub Custom Properties to enable customer self-service infra
 **What Changed:**
 
 1. **Customer Repos (source_monorepo)**
+
    - Workflows now fetch repository custom properties
    - Properties passed as metadata to manager repo
    - Workflow blocks until infrastructure setup complete
    - Supports opt-in tool selection
 
 2. **Manager Repo**
+
    - New `parse-capabilities` job to read customer properties
    - New `setup-spacelift-terraform` job for Terraform stack provisioning
    - New `setup-spacelift-ansible` job for Ansible stack provisioning
@@ -255,14 +414,14 @@ Added support for GitHub Custom Properties to enable customer self-service infra
 
 **New Custom Properties:**
 
-| Property | Type | Purpose |
-|----------|------|---------|
-| `infrastructure_tools` | Multi-select | Which tools to enable (terraform, ansible, etc.) |
-| `terraform_version` | Single-select | Terraform version for Spacelift |
-| `spacelift_auto_deploy` | Boolean | Auto-deploy on main branch |
-| `infrastructure_approval_required` | Boolean | Require manual approval |
-| `spacelift_stack_name` | String | Custom Spacelift stack name |
-| `ansible_inventory_path` | String | Path to Ansible inventory |
+| Property                           | Type          | Purpose                                          |
+| ---------------------------------- | ------------- | ------------------------------------------------ |
+| `infrastructure_tools`             | Multi-select  | Which tools to enable (terraform, ansible, etc.) |
+| `terraform_version`                | Single-select | Terraform version for Spacelift                  |
+| `spacelift_auto_deploy`            | Boolean       | Auto-deploy on main branch                       |
+| `infrastructure_approval_required` | Boolean       | Require manual approval                          |
+| `spacelift_stack_name`             | String        | Custom Spacelift stack name                      |
+| `ansible_inventory_path`           | String        | Path to Ansible inventory                        |
 
 **Benefits:**
 
@@ -296,6 +455,7 @@ customer_tier: "enterprise"
 **Migration Guide:**
 
 Existing customers:
+
 1. No immediate action required
 2. To opt-in: Set `infrastructure_tools` custom property
 3. On next `infra/` change, Spacelift stack will be auto-created
@@ -316,11 +476,13 @@ Existing customers:
 ### Added
 
 #### Documentation Structure
+
 - Created `docs/` folder for all documentation
 - Moved all `.md` files (except root `README.md`) to `docs/`
 - Root `README.md` serves as entry point with links to docs
 
 #### Context Updates
+
 - Reframed entire system as **customer/service provider relationship**
 - Updated terminology throughout:
   - "Source repos" → "Customer repositories"
@@ -329,12 +491,14 @@ Existing customers:
 #### New Documentation
 
 1. **ARCHITECTURE.md**
+
    - Service provider and customer roles clearly defined
    - Benefits matrix for both parties
    - Multi-tenant architecture documented
    - Security model explained
 
 2. **SETUP.md**
+
    - Split into Part 1 (Service Provider) and Part 2 (Customer)
    - Service provider prerequisites and setup
    - Customer onboarding process
@@ -342,6 +506,7 @@ Existing customers:
    - Production readiness checklist
 
 3. **QUICK-REFERENCE.md**
+
    - Separate sections for customers vs service providers
    - Customer-focused troubleshooting
    - Service provider monitoring and management
@@ -349,6 +514,7 @@ Existing customers:
    - Emergency procedures for both roles
 
 4. **PATTERNS.md**
+
    - Customer repository patterns (monorepo, separate repos, etc.)
    - Service provider view of multi-customer pattern
    - Customer onboarding patterns
@@ -406,28 +572,33 @@ After:
 ## Future Roadmap
 
 ### v2.0 - Multi-Cloud Support
+
 - Azure and GCP provider support
 - Cloud-specific custom properties
 - Cross-cloud state management
 
 ### v2.1 - Policy & Governance
+
 - OPA policy-as-code validation
 - Sentinel policy enforcement
 - Custom approval workflows per customer tier
 
 ### v2.2 - Enhanced Observability
+
 - Customer usage dashboards
 - Cost allocation and reporting
 - SLA monitoring and alerting
 - Infrastructure change analytics
 
 ### v2.3 - Additional Tools
+
 - Pulumi integration
 - CloudFormation support
 - Crossplane for Kubernetes
 - CDK support
 
 ### v3.0 - Customer Portal
+
 - Web-based customer portal
 - Self-service infrastructure requests
 - Cost transparency dashboard
@@ -438,6 +609,7 @@ After:
 ## Contributing
 
 This is a template repository. Contributions welcome for:
+
 - Additional tool integrations
 - Improved documentation
 - Bug fixes
@@ -447,7 +619,7 @@ This is a template repository. Contributions welcome for:
 
 ## Version History
 
-| Version | Date | Description |
-|---------|------|-------------|
+| Version    | Date | Description                            |
+| ---------- | ---- | -------------------------------------- |
 | Unreleased | 2024 | Custom Properties & Tool Orchestration |
-| 1.0.0 | 2024 | Initial release with customer/SP model |
+| 1.0.0      | 2024 | Initial release with customer/SP model |

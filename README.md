@@ -54,14 +54,59 @@ repo-management/
 └── README.md                      # 👈 You are here
 ```
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Using Templates)
+
+### 📦 This is a Template Repository!
+
+This project provides **ready-to-deploy GitHub repository templates** for instant setup.
+
+### Option 1: Use GitHub Templates (Recommended - 15 minutes)
+
+**Step 1: Create Manager Repository**
+
+```bash
+# 1. Navigate to manager_repo/ and click "Use this template"
+# 2. Name your repository (e.g., "infrastructure-manager")
+# 3. Clone and run setup:
+git clone https://github.com/YOUR-ORG/infrastructure-manager.git
+cd infrastructure-manager
+chmod +x setup.sh && ./setup.sh
+```
+
+**Step 2: Create Customer Repository**
+
+```bash
+# 1. Navigate to source_monorepo/ and click "Use this template"
+# 2. Name your repository (e.g., "customer-app")
+# 3. Clone and run setup:
+git clone https://github.com/YOUR-ORG/customer-app.git
+cd customer-app
+chmod +x setup.sh && ./setup.sh
+```
+
+**Step 3: Test the System**
+
+```bash
+# Make a change to trigger deployment
+echo "test: true" >> infra/variables.yml
+git add . && git commit -m "test: trigger deployment"
+git push
+gh run watch  # Watch the magic happen! ✨
+```
+
+**Done!** See [INSTALLATION.md](INSTALLATION.md) for complete guide.
+
+---
+
+### Option 2: Manual Setup (For customization)
 
 ### For Service Providers
 
 1. **Read the documentation**
 
+   - [INSTALLATION.md](INSTALLATION.md) - **START HERE** - Complete installation guide
    - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Understand the system design
-   - [SETUP.md](docs/SETUP.md) - Service provider setup instructions
+   - [SETUP.md](docs/SETUP.md) - Detailed setup instructions
 
 2. **Set up manager repository**
 
@@ -158,6 +203,58 @@ spacelift_auto_deploy: false
 
 See [CUSTOM-PROPERTIES.md](docs/CUSTOM-PROPERTIES.md) for complete guide.
 
+### ⭐ **NEW: Unified Compliance with OpenSSF Scorecard**
+
+This system now integrates OpenSSF Scorecard with custom properties compliance to produce a **single unified security and governance score**:
+
+```
+┌──────────────────────────────────────────┐
+│  Unified Compliance Score: 8.2/10        │
+├──────────────────────────────────────────┤
+│  • OpenSSF Scorecard:      8.5/10  ✅    │
+│  • Custom Properties:      7.9/10  ✅    │
+│  • Total Repos Scanned:    142           │
+│  • Compliant Repos:        128 (90%)     │
+└──────────────────────────────────────────┘
+```
+
+**Benefits**:
+
+- 🎯 Single score for security AND governance
+- 📊 Visible in GitHub Security tab
+- 🔍 Industry-standard security checks + org-specific compliance
+- 🏷️ Custom Properties Compliance treated as Critical risk check
+- 📈 Track improvements over time
+- 🚨 Block deployments on low scores
+
+**How it works**: Your compliance scanner converts violations to a 0-10 score, which is fed into Scorecard as a custom check. Scorecard recalculates the aggregate score using weighted averages based on risk levels.
+
+See [SCORECARD-INTEGRATION.md](docs/SCORECARD-INTEGRATION.md) for complete guide.
+
+### 🎨 **NEW: Web Dashboard for Compliance Visualization**
+
+A beautiful web-based dashboard to visualize and track compliance scores across your organization:
+
+```
+Dashboard Features:
+├─ 📊 Organization Overview       - Unified score at a glance
+├─ 📈 Trend Analysis             - 30/60/90 day trends
+├─ 🏆 Top/Bottom Performers      - Identify leaders and laggards
+├─ 🎯 Score Distribution         - Visual breakdown by grade
+├─ 📦 Repository Details         - Drill-down into individual repos
+└─ ⚡ Real-time Updates          - Auto-updated after each scan
+```
+
+**Quick Start**:
+
+```bash
+cd manager_repo/dashboard
+docker-compose up -d
+# Dashboard available at http://localhost:3001
+```
+
+See [dashboard/README.md](manager_repo/dashboard/README.md) for complete setup guide.
+
 ### For Service Providers
 
 ✅ **Centralized Control** - All infrastructure code in one place  
@@ -214,17 +311,19 @@ on:
 
 ## 📚 Documentation
 
-| Document                                                   | Audience         | Purpose                                                  |
-| ---------------------------------------------------------- | ---------------- | -------------------------------------------------------- |
-| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)**                | Both             | System design, diagrams, and principles                  |
-| **[SETUP.md](docs/SETUP.md)**                              | Both             | Step-by-step setup for service providers and customers   |
-| **[CUSTOM-PROPERTIES.md](docs/CUSTOM-PROPERTIES.md)**      | Both             | **NEW!** GitHub Custom Properties for tool orchestration |
-| **[COMPLIANCE.md](docs/COMPLIANCE.md)**                    | Both             | **NEW!** Compliance scanning & drift detection           |
-| **[TESTING.md](docs/TESTING.md)**                          | Both             | **NEW!** Test/dry-run modes for safe testing             |
-| **[QUICK-REFERENCE.md](docs/QUICK-REFERENCE.md)**          | Both             | Commands, troubleshooting, and quick lookups             |
-| **[PATTERNS.md](docs/PATTERNS.md)**                        | Both             | Repository patterns and when to use them                 |
-| **[manager_repo/README.md](manager_repo/README.md)**       | Service Provider | Manager repo details                                     |
-| **[source_monorepo/README.md](source_monorepo/README.md)** | Customer         | Example customer repo                                    |
+| Document                                                      | Audience         | Purpose                                                 |
+| ------------------------------------------------------------- | ---------------- | ------------------------------------------------------- |
+| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)**                   | Both             | System design, diagrams, and principles                 |
+| **[SETUP.md](docs/SETUP.md)**                                 | Both             | Step-by-step setup for service providers and customers  |
+| **[CUSTOM-PROPERTIES.md](docs/CUSTOM-PROPERTIES.md)**         | Both             | GitHub Custom Properties for tool orchestration         |
+| **[COMPLIANCE.md](docs/COMPLIANCE.md)**                       | Both             | Compliance scanning & drift detection                   |
+| **[SCORECARD-INTEGRATION.md](docs/SCORECARD-INTEGRATION.md)** | Both             | **NEW!** OpenSSF Scorecard + compliance unified scoring |
+| **[AUTO-REMEDIATION.md](docs/AUTO-REMEDIATION.md)**           | Both             | Auto-fixing property drift                              |
+| **[TESTING.md](docs/TESTING.md)**                             | Both             | Test/dry-run modes for safe testing                     |
+| **[QUICK-REFERENCE.md](docs/QUICK-REFERENCE.md)**             | Both             | Commands, troubleshooting, and quick lookups            |
+| **[PATTERNS.md](docs/PATTERNS.md)**                           | Both             | Repository patterns and when to use them                |
+| **[manager_repo/README.md](manager_repo/README.md)**          | Service Provider | Manager repo details                                    |
+| **[source_monorepo/README.md](source_monorepo/README.md)**    | Customer         | Example customer repo                                   |
 
 ## 🎨 Use Cases
 

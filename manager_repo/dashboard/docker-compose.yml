@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  api:
+    build: ./backend
+    container_name: compliance-dashboard-api
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_ORG=${GITHUB_ORG}
+      - DB_PATH=/app/data/compliance.db
+      - FRONTEND_URL=http://localhost:3001
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ui:
+    build: ./frontend
+    container_name: compliance-dashboard-ui
+    ports:
+      - "3001:80"
+    depends_on:
+      - api
+    environment:
+      - VITE_API_URL=http://localhost:3000
+    restart: unless-stopped
+
+volumes:
+  data:
+    driver: local
+

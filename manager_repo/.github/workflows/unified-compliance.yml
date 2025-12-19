@@ -1,0 +1,600 @@
+name: Unified Compliance with Scorecard
+
+# This workflow combines custom properties compliance with OpenSSF Scorecard
+# to produce a single comprehensive security and governance score
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight
+  workflow_dispatch:
+    inputs:
+      repo_filter:
+        description: 'Filter repositories (regex pattern, empty = all)'
+        required: false
+        default: ''
+      severity_filter:
+        description: 'Minimum severity to report'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - low
+          - medium
+          - high
+          - critical
+      remediate:
+        description: 'Auto-remediate safe violations'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+  actions: read
+
+jobs:
+  # Step 1: Run custom properties compliance scan
+  properties-compliance:
+    runs-on: ubuntu-latest
+    outputs:
+      compliance_score: ${{ steps.calculate-score.outputs.score }}
+      total_repos: ${{ steps.calculate-score.outputs.total_repos }}
+      compliant_repos: ${{ steps.calculate-score.outputs.compliant_repos }}
+      
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load Compliance Configuration
+        id: config
+        run: |
+          CONFIG=$(cat .github/compliance/config.json)
+          echo "config<<EOF" >> $GITHUB_OUTPUT
+          echo "$CONFIG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Scan Custom Properties Compliance
+        id: scan
+        uses: actions/github-script@v7
+        env:
+          REPO_FILTER: ${{ github.event.inputs.repo_filter }}
+          SEVERITY_FILTER: ${{ github.event.inputs.severity_filter }}
+          REMEDIATE: ${{ github.event.inputs.remediate }}
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('.github/compliance/config.json', 'utf8'));
+            
+            // Fetch all repos in organization
+            const { data: repos } = await github.rest.repos.listForOrg({
+              org: context.repo.owner,
+              type: 'all',
+              per_page: 100
+            });
+            
+            core.info(`Found ${repos.length} repositories in organization`);
+            
+            const results = [];
+            const violations = [];
+            const fixes = [];
+            
+            // Filter repos based on input
+            const repoFilter = process.env.REPO_FILTER || '';
+            const filteredRepos = repoFilter 
+              ? repos.filter(r => new RegExp(repoFilter).test(r.name))
+              : repos;
+            
+            // Filter out excluded repos
+            const activeRepos = filteredRepos.filter(repo => {
+              const excluded = config.repository_exclusions.some(pattern => {
+                if (pattern.endsWith('*')) {
+                  return repo.name.startsWith(pattern.slice(0, -1));
+                }
+                return repo.name === pattern;
+              });
+              return !excluded && !repo.archived;
+            });
+            
+            core.info(`Scanning ${activeRepos.length} repositories (after exclusions)`);
+            
+            for (const repo of activeRepos) {
+              try {
+                // Fetch custom properties
+                const { data: props } = await github.rest.repos.getCustomPropertiesValues({
+                  owner: context.repo.owner,
+                  repo: repo.name
+                });
+                
+                // Build property map
+                const propMap = {};
+                props.forEach(p => {
+                  propMap[p.property_name] = p.value;
+                });
+                
+                const repoViolations = [];
+                
+                // Check required properties
+                for (const requiredProp of config.required_properties) {
+                  if (!propMap[requiredProp]) {
+                    repoViolations.push({
+                      repo: repo.name,
+                      type: 'missing_required',
+                      property: requiredProp,
+                      severity: config.severity_rules.missing_required || 'high',
+                      message: `Missing required property: ${requiredProp}`
+                    });
+                  }
+                }
+                
+                // Check required properties for infra repos
+                const hasInfraContent = propMap.repo_content_type?.includes('infra');
+                if (hasInfraContent && config.required_for_infra_repos) {
+                  for (const requiredProp of config.required_for_infra_repos) {
+                    if (!propMap[requiredProp]) {
+                      repoViolations.push({
+                        repo: repo.name,
+                        type: 'missing_required',
+                        property: requiredProp,
+                        severity: config.severity_rules.missing_required || 'high',
+                        message: `Missing required property for infra repo: ${requiredProp}`
+                      });
+                    }
+                  }
+                }
+                
+                // Check valid values
+                for (const [propName, value] of Object.entries(propMap)) {
+                  const validValues = config.valid_values[propName];
+                  if (validValues && validValues.length > 0) {
+                    const values = Array.isArray(value) ? value : [value];
+                    for (const v of values) {
+                      if (!validValues.includes(v)) {
+                        repoViolations.push({
+                          repo: repo.name,
+                          type: 'invalid_value',
+                          property: propName,
+                          severity: config.severity_rules.invalid_value || 'high',
+                          message: `Invalid value '${v}' for ${propName}. Allowed: ${validValues.join(', ')}`,
+                          current_value: v,
+                          allowed_values: validValues
+                        });
+                      }
+                    }
+                  }
+                }
+                
+                violations.push(...repoViolations);
+                
+                results.push({
+                  repo: repo.name,
+                  violations: repoViolations.length,
+                  compliant: repoViolations.length === 0,
+                  properties: propMap
+                });
+                
+                if (repoViolations.length > 0) {
+                  core.info(`⚠️  ${repo.name}: ${repoViolations.length} violations`);
+                } else {
+                  core.info(`✅ ${repo.name}: compliant`);
+                }
+                
+              } catch (error) {
+                core.warning(`Failed to scan ${repo.name}: ${error.message}`);
+              }
+            }
+            
+            // Save results
+            fs.writeFileSync('compliance-results.json', JSON.stringify({
+              scan_date: new Date().toISOString(),
+              total_repos: activeRepos.length,
+              compliant_repos: results.filter(r => r.compliant).length,
+              violations_count: violations.length,
+              violations,
+              results,
+              fixes
+            }, null, 2));
+            
+            core.info(`\n📊 Scan complete:`);
+            core.info(`   Total repos: ${activeRepos.length}`);
+            core.info(`   Compliant: ${results.filter(r => r.compliant).length}`);
+            core.info(`   Violations: ${violations.length}`);
+            
+            return { total_repos: activeRepos.length, violations: violations.length };
+      
+      - name: Calculate Compliance Score
+        id: calculate-score
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('compliance-results.json', 'utf8'));
+            const config = JSON.parse(fs.readFileSync('.github/compliance/config.json', 'utf8'));
+            
+            // Scoring algorithm
+            function calculateRepoScore(repoResult, config) {
+              let score = 10.0;
+              
+              for (const violation of repoResult.violations || []) {
+                const deduction = {
+                  'critical': 3.0,
+                  'high': 1.5,
+                  'medium': 0.5,
+                  'low': 0.2
+                }[violation.severity] || 0.5;
+                
+                score -= deduction;
+              }
+              
+              // Floor at 0
+              score = Math.max(0, score);
+              
+              // Bonus for having optional properties (shows maturity)
+              const optionalProps = config.optional_properties || [];
+              const hasOptional = optionalProps.filter(opt => 
+                repoResult.properties && repoResult.properties[opt]
+              ).length;
+              
+              if (score >= 8 && hasOptional > 3) {
+                score = Math.min(10, score + 0.5);
+              }
+              
+              return score;
+            }
+            
+            // Calculate individual repo scores
+            const repoScores = results.results.map(r => ({
+              repo: r.repo,
+              score: calculateRepoScore({
+                violations: results.violations.filter(v => v.repo === r.repo),
+                properties: r.properties
+              }, config)
+            }));
+            
+            // Calculate aggregate score (average across all repos)
+            const totalScore = repoScores.reduce((sum, r) => sum + r.score, 0);
+            const avgScore = results.total_repos > 0 
+              ? (totalScore / results.total_repos).toFixed(2)
+              : 0;
+            
+            core.info(`\n📊 Compliance Scoring:`);
+            core.info(`   Average Score: ${avgScore}/10`);
+            core.info(`   Distribution:`);
+            
+            const excellent = repoScores.filter(r => r.score >= 9).length;
+            const good = repoScores.filter(r => r.score >= 7 && r.score < 9).length;
+            const fair = repoScores.filter(r => r.score >= 5 && r.score < 7).length;
+            const poor = repoScores.filter(r => r.score < 5).length;
+            
+            core.info(`     Excellent (9-10): ${excellent}`);
+            core.info(`     Good (7-9): ${good}`);
+            core.info(`     Fair (5-7): ${fair}`);
+            core.info(`     Poor (0-5): ${poor}`);
+            
+            // Save detailed scores
+            fs.writeFileSync('compliance-scores.json', JSON.stringify({
+              aggregate_score: parseFloat(avgScore),
+              repo_scores: repoScores,
+              distribution: { excellent, good, fair, poor }
+            }, null, 2));
+            
+            core.setOutput('score', avgScore);
+            core.setOutput('total_repos', results.total_repos);
+            core.setOutput('compliant_repos', results.compliant_repos);
+            
+            return avgScore;
+      
+      - name: Upload Compliance Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-results
+          path: |
+            compliance-results.json
+            compliance-scores.json
+
+  # Step 2: Run OpenSSF Scorecard
+  scorecard-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      scorecard_score: ${{ steps.run-scorecard.outputs.aggregate_score }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Scorecard Analysis
+        id: run-scorecard
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          repo_token: ${{ secrets.SOURCE_REPOS_PAT || secrets.GITHUB_TOKEN }}
+          publish_results: false
+      
+      - name: Extract Scorecard Score
+        id: extract-score
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read SARIF results
+            const sarif = JSON.parse(fs.readFileSync('scorecard-results.sarif', 'utf8'));
+            
+            // Extract aggregate score from Scorecard
+            const properties = sarif.runs[0]?.properties || {};
+            const aggregateScore = properties.aggregateScore || 0;
+            
+            core.info(`OpenSSF Scorecard aggregate score: ${aggregateScore}/10`);
+            core.setOutput('aggregate_score', aggregateScore);
+            
+            return aggregateScore;
+      
+      - name: Upload Scorecard Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: scorecard-results.sarif
+
+  # Step 3: Merge compliance into Scorecard results
+  merge-results:
+    needs: [properties-compliance, scorecard-scan]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+      
+      - name: Merge Compliance into Scorecard
+        uses: actions/github-script@v7
+        env:
+          COMPLIANCE_SCORE: ${{ needs.properties-compliance.outputs.compliance_score }}
+          SCORECARD_SCORE: ${{ needs.scorecard-scan.outputs.scorecard_score }}
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read Scorecard SARIF
+            const sarif = JSON.parse(
+              fs.readFileSync('scorecard-results/scorecard-results.sarif', 'utf8')
+            );
+            
+            // Read compliance results
+            const compliance = JSON.parse(
+              fs.readFileSync('compliance-results/compliance-results.json', 'utf8')
+            );
+            
+            const complianceScores = JSON.parse(
+              fs.readFileSync('compliance-results/compliance-scores.json', 'utf8')
+            );
+            
+            const complianceScore = parseFloat(process.env.COMPLIANCE_SCORE);
+            
+            core.info(`\n🔄 Merging Results:`);
+            core.info(`   Scorecard Score: ${process.env.SCORECARD_SCORE}/10`);
+            core.info(`   Compliance Score: ${complianceScore}/10`);
+            
+            // Add custom check to Scorecard results
+            sarif.runs[0].tool.driver.rules.push({
+              id: "Custom-Properties-Compliance",
+              name: "CustomPropertiesCompliance",
+              shortDescription: {
+                text: "Validates GitHub Custom Properties compliance across organization"
+              },
+              fullDescription: {
+                text: "Checks that all repositories have required custom properties set correctly, including customer_tier, infrastructure_tools, team_owner, and repo_content_type. This ensures proper governance and automation."
+              },
+              help: {
+                text: "Set required custom properties on all repositories. See .github/compliance/config.json for requirements.",
+                markdown: "## Custom Properties Compliance\n\nEnsure all repositories have:\n- Required properties set\n- Valid values\n- Content type matching structure\n\nSee [COMPLIANCE.md](../docs/COMPLIANCE.md) for details."
+              },
+              defaultConfiguration: {
+                level: complianceScore >= 7 ? "warning" : "error"
+              },
+              properties: {
+                score: complianceScore,
+                risk: "Critical",
+                tags: ["governance", "compliance", "custom-check", "properties"],
+                precision: "high",
+                "security-severity": complianceScore < 5 ? "8.0" : complianceScore < 7 ? "6.0" : "3.0"
+              }
+            });
+            
+            // Add result for each violation
+            for (const violation of compliance.violations.slice(0, 50)) {  // Limit to 50 for SARIF
+              const level = {
+                'critical': 'error',
+                'high': 'error',
+                'medium': 'warning',
+                'low': 'note'
+              }[violation.severity] || 'warning';
+              
+              sarif.runs[0].results.push({
+                ruleId: "Custom-Properties-Compliance",
+                level: level,
+                message: {
+                  text: `[${violation.repo}] ${violation.message}`
+                },
+                locations: [{
+                  physicalLocation: {
+                    artifactLocation: {
+                      uri: `.github/properties/${violation.repo}`,
+                      uriBaseId: "%SRCROOT%"
+                    },
+                    region: {
+                      startLine: 1,
+                      startColumn: 1
+                    }
+                  },
+                  logicalLocations: [{
+                    name: violation.property,
+                    kind: "property"
+                  }]
+                }],
+                properties: {
+                  repo: violation.repo,
+                  property: violation.property,
+                  violation_type: violation.type
+                }
+              });
+            }
+            
+            // Recalculate aggregate score with compliance included
+            const checks = sarif.runs[0].tool.driver.rules;
+            let totalWeighted = 0;
+            let totalWeight = 0;
+            
+            checks.forEach(check => {
+              const score = check.properties?.score || 0;
+              const risk = check.properties?.risk || "Low";
+              
+              // Weight by risk (same as Scorecard)
+              const weight = {
+                'Critical': 10,
+                'High': 7.5,
+                'Medium': 5,
+                'Low': 2.5
+              }[risk] || 2.5;
+              
+              totalWeighted += score * weight;
+              totalWeight += weight;
+            });
+            
+            const aggregateScore = totalWeight > 0 
+              ? (totalWeighted / totalWeight).toFixed(1) 
+              : 0;
+            
+            // Update aggregate score in properties
+            sarif.runs[0].properties = sarif.runs[0].properties || {};
+            sarif.runs[0].properties.aggregateScore = parseFloat(aggregateScore);
+            sarif.runs[0].properties.customPropertiesCompliance = {
+              score: complianceScore,
+              total_repos: compliance.total_repos,
+              compliant_repos: compliance.compliant_repos,
+              violations: compliance.violations_count
+            };
+            
+            // Write merged results
+            fs.writeFileSync(
+              'scorecard-results-merged.sarif',
+              JSON.stringify(sarif, null, 2)
+            );
+            
+            core.info(`\n✅ Merged Results:`);
+            core.info(`   Total Checks: ${checks.length}`);
+            core.info(`   Aggregate Score: ${aggregateScore}/10`);
+            core.info(`   (includes ${compliance.violations_count} compliance violations)`);
+            
+            // Generate summary
+            const summary = `## 🎯 Unified Compliance Score: ${aggregateScore}/10
+            
+### Component Scores
+
+| Component | Score | Status |
+|-----------|-------|--------|
+| OpenSSF Scorecard | ${process.env.SCORECARD_SCORE}/10 | ${parseFloat(process.env.SCORECARD_SCORE) >= 7 ? '✅' : '⚠️'} |
+| Custom Properties | ${complianceScore}/10 | ${complianceScore >= 7 ? '✅' : '⚠️'} |
+| **Combined** | **${aggregateScore}/10** | ${parseFloat(aggregateScore) >= 7 ? '✅' : '⚠️'} |
+
+### Custom Properties Compliance
+
+- **Total Repositories**: ${compliance.total_repos}
+- **Compliant**: ${compliance.compliant_repos} (${Math.round(compliance.compliant_repos / compliance.total_repos * 100)}%)
+- **Violations**: ${compliance.violations_count}
+
+### Distribution
+
+- Excellent (9-10): ${complianceScores.distribution.excellent} repos
+- Good (7-9): ${complianceScores.distribution.good} repos
+- Fair (5-7): ${complianceScores.distribution.fair} repos
+- Poor (0-5): ${complianceScores.distribution.poor} repos
+
+${parseFloat(aggregateScore) < 7 ? '### ⚠️ Action Required\n\nAggregate score is below 7. Please review violations and remediate.' : ''}
+`;
+            
+            fs.writeFileSync('compliance-summary.md', summary);
+            
+            core.summary.addRaw(summary);
+            await core.summary.write();
+            
+            core.setOutput('aggregate_score', aggregateScore);
+      
+      - name: Upload Merged Results to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard-results-merged.sarif
+          category: unified-compliance
+      
+      - name: Upload Summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-results
+          path: |
+            scorecard-results-merged.sarif
+            compliance-summary.md
+      
+      - name: Create/Update Compliance Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('compliance-summary.md', 'utf8');
+            const compliance = JSON.parse(
+              fs.readFileSync('compliance-results/compliance-results.json', 'utf8')
+            );
+            
+            // Find existing issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'compliance-report'
+            });
+            
+            const existingIssue = issues.find(i => 
+              i.title.includes('Unified Compliance Report')
+            );
+            
+            const body = `${summary}
+
+---
+
+<details>
+<summary>📋 Detailed Violations (${compliance.violations_count})</summary>
+
+${compliance.violations.slice(0, 20).map(v => 
+  `- **${v.repo}**: [${v.severity}] ${v.message}`
+).join('\n')}
+
+${compliance.violations_count > 20 ? `\n... and ${compliance.violations_count - 20} more. See workflow artifacts for full report.` : ''}
+
+</details>
+
+---
+
+**Last Updated**: ${new Date().toISOString()}  
+**Workflow Run**: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+`;
+            
+            if (existingIssue) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: body
+              });
+              core.info(`✅ Updated issue #${existingIssue.number}`);
+            } else {
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '📊 Unified Compliance Report',
+                body: body,
+                labels: ['compliance-report', 'automated']
+              });
+              core.info(`✅ Created issue #${newIssue.number}`);
+            }
+

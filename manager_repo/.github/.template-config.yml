@@ -1,0 +1,38 @@
+# GitHub Repository Template Configuration
+# This file configures how the template repository behaves
+
+name: Infrastructure Manager Repository Template
+description: >
+  Centralized infrastructure management repository for service providers.
+  Handles Terraform deployments, compliance scanning, and unified scoring
+  across multiple customer repositories using GitHub Actions and OpenSSF Scorecard.
+
+labels:
+  - template
+  - infrastructure
+  - terraform
+  - compliance
+  - scorecard
+
+# Files/directories to exclude when creating from template
+exclude:
+  - .git
+  - .github/workflows/*.log
+  - terraform/.terraform
+  - terraform/terraform.tfstate*
+  - dashboard/backend/data/
+  - dashboard/backend/node_modules/
+  - dashboard/frontend/node_modules/
+  - dashboard/frontend/dist/
+  - "*.log"
+  - ".DS_Store"
+
+# Pre-configured settings for new repositories
+settings:
+  has_issues: true
+  has_projects: true
+  has_wiki: false
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: true
+  delete_branch_on_merge: true

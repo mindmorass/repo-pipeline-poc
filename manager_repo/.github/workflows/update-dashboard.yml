@@ -1,0 +1,205 @@
+name: Update Compliance Dashboard
+
+# Triggers after unified compliance scan completes
+on:
+  workflow_run:
+    workflows: ["Unified Compliance with Scorecard"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Specific workflow run ID to process"
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  update-dashboard:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Download Compliance Results
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const runId = process.env.RUN_ID;
+
+            if (!runId) {
+              core.setFailed('No run ID provided');
+              return;
+            }
+
+            core.info(`Fetching artifacts from run ${runId}`);
+
+            // List artifacts
+            const { data: artifacts } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+
+            // Find unified results
+            const unifiedArtifact = artifacts.artifacts.find(a => 
+              a.name === 'unified-results'
+            );
+
+            const complianceArtifact = artifacts.artifacts.find(a =>
+              a.name === 'compliance-results'
+            );
+
+            if (!unifiedArtifact || !complianceArtifact) {
+              core.setFailed('Required artifacts not found');
+              return;
+            }
+
+            // Download artifacts
+            const unifiedDownload = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: unifiedArtifact.id,
+              archive_format: 'zip'
+            });
+
+            const complianceDownload = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: complianceArtifact.id,
+              archive_format: 'zip'
+            });
+
+            // Save artifacts
+            fs.writeFileSync('unified.zip', Buffer.from(unifiedDownload.data));
+            fs.writeFileSync('compliance.zip', Buffer.from(complianceDownload.data));
+
+            core.info('✅ Artifacts downloaded');
+
+      - name: Extract and Parse Results
+        run: |
+          unzip -o unified.zip -d unified/
+          unzip -o compliance.zip -d compliance/
+
+          echo "Files extracted:"
+          ls -la unified/
+          ls -la compliance/
+
+      - name: Update Dashboard Database
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Read SARIF
+            const sarifPath = 'unified/scorecard-results-merged.sarif';
+            if (!fs.existsSync(sarifPath)) {
+              core.setFailed('SARIF file not found');
+              return;
+            }
+
+            const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+
+            // Read compliance results
+            const compliancePath = 'compliance/compliance-results.json';
+            const compliance = JSON.parse(fs.readFileSync(compliancePath, 'utf8'));
+
+            const complianceScoresPath = 'compliance/compliance-scores.json';
+            const complianceScores = JSON.parse(fs.readFileSync(complianceScoresPath, 'utf8'));
+
+            // Extract scores
+            const aggregateScore = sarif.runs[0]?.properties?.aggregateScore || 0;
+            const customPropsData = sarif.runs[0]?.properties?.customPropertiesCompliance || {};
+
+            const scanDate = new Date().toISOString().split('T')[0];
+
+            // Prepare data for dashboard
+            const dashboardData = {
+              scan_date: scanDate,
+              organization: {
+                unified_score: aggregateScore,
+                scorecard_score: 0, // Extract from SARIF if available
+                compliance_score: complianceScores.aggregate_score,
+                total_repos: compliance.total_repos,
+                compliant_repos: compliance.compliant_repos,
+                distribution: complianceScores.distribution
+              },
+              repositories: complianceScores.repo_scores.map(repo => ({
+                name: repo.repo,
+                unified_score: repo.score,
+                compliance_score: repo.score,
+                violations_count: compliance.violations.filter(v => v.repo === repo.repo).length,
+                scan_date: scanDate
+              }))
+            };
+
+            // Save for dashboard ingestion
+            fs.writeFileSync(
+              'dashboard-data.json',
+              JSON.stringify(dashboardData, null, 2)
+            );
+
+            core.info(`✅ Prepared dashboard data for ${dashboardData.repositories.length} repos`);
+            core.setOutput('data_file', 'dashboard-data.json');
+
+      - name: Send to Dashboard API
+        env:
+          DASHBOARD_API_URL: ${{ secrets.DASHBOARD_API_URL || 'http://localhost:3000' }}
+          DASHBOARD_API_KEY: ${{ secrets.DASHBOARD_API_KEY }}
+        run: |
+          if [ -z "$DASHBOARD_API_URL" ]; then
+            echo "⚠️  DASHBOARD_API_URL not set, skipping API update"
+            echo "Data saved to dashboard-data.json for manual import"
+            exit 0
+          fi
+
+          # Send data to dashboard API
+          curl -X POST "$DASHBOARD_API_URL/api/ingest" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${DASHBOARD_API_KEY}" \
+            -d @dashboard-data.json \
+            -f -s -S || {
+              echo "⚠️  Failed to send to dashboard API"
+              echo "Data saved to dashboard-data.json for manual import"
+              exit 0
+            }
+
+          echo "✅ Dashboard updated successfully"
+
+      - name: Upload Dashboard Data
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-data
+          path: dashboard-data.json
+          retention-days: 90
+
+      - name: Create Dashboard Update Summary
+        run: |
+          cat << 'EOF' > $GITHUB_STEP_SUMMARY
+          ## 📊 Dashboard Updated
+
+          The compliance dashboard has been updated with the latest scan results.
+
+          ### Summary
+          - **Scan Date**: $(date +%Y-%m-%d)
+          - **Total Repositories**: $(jq -r '.organization.total_repos' dashboard-data.json)
+          - **Organization Score**: $(jq -r '.organization.unified_score' dashboard-data.json)/10
+          - **Compliance Score**: $(jq -r '.organization.compliance_score' dashboard-data.json)/10
+
+          ### Access Dashboard
+          - **URL**: ${DASHBOARD_URL:-http://localhost:3001}
+          - **Data File**: dashboard-data.json (uploaded as artifact)
+
+          EOF

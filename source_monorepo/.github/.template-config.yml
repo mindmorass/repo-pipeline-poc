@@ -1,0 +1,34 @@
+# GitHub Repository Template Configuration
+# This file configures how the template repository behaves
+
+name: Customer Repository Template (Monorepo)
+description: >
+  Customer repository template with application and infrastructure code.
+  Includes GitHub Actions workflows for infrastructure deployment
+  via the manager repository, with compliance validation and property management.
+
+labels:
+  - template
+  - customer-repo
+  - monorepo
+  - infrastructure
+
+# Files/directories to exclude when creating from template
+exclude:
+  - .git
+  - .github/workflows/*.log
+  - app/node_modules/
+  - app/dist/
+  - "*.log"
+  - ".DS_Store"
+
+# Pre-configured settings for new repositories
+settings:
+  has_issues: true
+  has_projects: false
+  has_wiki: false
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: true
+  delete_branch_on_merge: true
+

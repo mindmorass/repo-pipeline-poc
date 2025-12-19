@@ -1,0 +1,341 @@
+name: Trigger Infrastructure Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "infra/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Test mode - no actual deployments'
+        type: boolean
+        default: false
+      environment:
+        description: 'Environment to test'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+        default: dev
+
+# Make this a required check that blocks other workflows
+concurrency:
+  group: infrastructure-${{ github.ref }}
+  cancel-in-progress: false  # Don't cancel - must complete
+
+jobs:
+  fetch-capabilities:
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.props.outputs.tools }}
+      spacelift_auto_deploy: ${{ steps.props.outputs.spacelift_auto_deploy }}
+      terraform_enabled: ${{ steps.props.outputs.terraform_enabled }}
+      ansible_enabled: ${{ steps.props.outputs.ansible_enabled }}
+      properties_json: ${{ steps.props.outputs.properties_json }}
+      dry_run: ${{ steps.set-mode.outputs.dry_run }}
+    steps:
+      - name: Set Test Mode
+        id: set-mode
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "🧪 TEST MODE ENABLED - No actual deployments will run"
+            echo "   This will test:"
+            echo "   ✓ Workflow triggers and linkages"
+            echo "   ✓ Job execution flow"
+            echo "   ✓ Notification and feedback"
+            echo "   ✗ Actual infrastructure changes (SKIPPED)"
+          fi
+
+      - name: Fetch Repository Custom Properties
+        id: props
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              // Fetch custom properties for this repo
+              const { data: props } = await github.rest.repos.getCustomPropertiesValues({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              
+              core.info(`Fetched ${props.length} custom properties`);
+              
+              // Extract relevant properties
+              const toolsProp = props.find(p => p.property_name === 'infrastructure_tools');
+              const tools = toolsProp ? (Array.isArray(toolsProp.value) ? toolsProp.value : [toolsProp.value]) : [];
+              
+              const spaceliftAutoDeploy = props.find(p => p.property_name === 'spacelift_auto_deploy')?.value || false;
+              const terraformVersion = props.find(p => p.property_name === 'terraform_version')?.value || 'latest';
+              const approvalRequired = props.find(p => p.property_name === 'infrastructure_approval_required')?.value !== false;
+              const stackName = props.find(p => p.property_name === 'spacelift_stack_name')?.value || '';
+              const ansibleInventory = props.find(p => p.property_name === 'ansible_inventory_path')?.value || 'inventory/';
+              
+              // Set outputs
+              core.setOutput('tools', JSON.stringify(tools));
+              core.setOutput('spacelift_auto_deploy', spaceliftAutoDeploy);
+              core.setOutput('terraform_enabled', tools.includes('terraform'));
+              core.setOutput('ansible_enabled', tools.includes('ansible'));
+              
+              // Create comprehensive properties object for manager repo
+              const propertiesPayload = {
+                tools,
+                spacelift_auto_deploy: spaceliftAutoDeploy,
+                terraform_version: terraformVersion,
+                approval_required: approvalRequired,
+                stack_name: stackName || `${context.repo.repo}-${context.ref.split('/').pop()}`,
+                ansible_inventory_path: ansibleInventory,
+                repo_name: context.repo.repo,
+                repo_owner: context.repo.owner
+              };
+              
+              core.setOutput('properties_json', JSON.stringify(propertiesPayload));
+              
+              core.info(`Infrastructure tools enabled: ${tools.join(', ') || 'none'}`);
+              
+              return propertiesPayload;
+            } catch (error) {
+              // If custom properties API fails (not in same org or not available)
+              // default to empty configuration
+              core.warning(`Could not fetch custom properties: ${error.message}`);
+              core.warning('Defaulting to no infrastructure tools enabled');
+              
+              const defaultProps = {
+                tools: [],
+                spacelift_auto_deploy: false,
+                terraform_version: 'latest',
+                approval_required: true,
+                stack_name: `${context.repo.repo}-${context.ref.split('/').pop()}`,
+                ansible_inventory_path: 'inventory/',
+                repo_name: context.repo.repo,
+                repo_owner: context.repo.owner
+              };
+              
+              core.setOutput('tools', '[]');
+              core.setOutput('spacelift_auto_deploy', false);
+              core.setOutput('terraform_enabled', false);
+              core.setOutput('ansible_enabled', false);
+              core.setOutput('properties_json', JSON.stringify(defaultProps));
+              
+              return defaultProps;
+            }
+
+  trigger-manager:
+    runs-on: ubuntu-latest
+    needs: fetch-capabilities
+    # Only trigger if at least one tool is enabled
+    if: needs.fetch-capabilities.outputs.tools != '[]'
+    outputs:
+      manager_run_id: ${{ steps.trigger.outputs.run_id }}
+      manager_run_url: ${{ steps.trigger.outputs.manager_run_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trigger Manager Repo Workflow
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.MANAGER_REPO_PAT }}
+          script: |
+            const properties = JSON.parse('${{ needs.fetch-capabilities.outputs.properties_json }}');
+            
+            core.info(`Triggering manager repo with properties: ${JSON.stringify(properties, null, 2)}`);
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: '${{ vars.MANAGER_REPO_OWNER }}',
+              repo: '${{ vars.MANAGER_REPO_NAME }}',
+              workflow_id: 'infra-deploy.yml',
+              ref: 'main',
+              inputs: {
+                source_repo: context.repo.repo,
+                source_owner: context.repo.owner,
+                source_ref: context.ref,
+                source_sha: context.sha,
+                environment: context.ref.includes('main') ? 'production' : 'staging',
+                infra_path: 'infra',
+                triggered_by: context.actor,
+                run_id: context.runId.toString(),
+                // NEW: Pass infrastructure capabilities
+                infrastructure_properties: JSON.stringify(properties),
+                // Pass dry-run flag for testing
+                dry_run: '${{ needs.fetch-capabilities.outputs.dry_run }}'
+              }
+            });
+            
+            const managerUrl = `https://github.com/${{ vars.MANAGER_REPO_OWNER }}/${{ vars.MANAGER_REPO_NAME }}/actions`;
+            core.info(`Triggered workflow in manager repo`);
+            core.setOutput('manager_run_url', managerUrl);
+            
+            // Wait a moment for the workflow to start
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Try to find the triggered run
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: '${{ vars.MANAGER_REPO_OWNER }}',
+              repo: '${{ vars.MANAGER_REPO_NAME }}',
+              workflow_id: 'infra-deploy.yml',
+              per_page: 5
+            });
+            
+            const triggeredRun = runs.data.workflow_runs.find(run => 
+              run.status === 'queued' || run.status === 'in_progress'
+            );
+            
+            if (triggeredRun) {
+              core.setOutput('run_id', triggeredRun.id);
+              core.info(`Found triggered run: ${triggeredRun.id}`);
+            }
+
+      - name: Comment on PR with Capabilities
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const properties = JSON.parse('${{ needs.fetch-capabilities.outputs.properties_json }}');
+            
+            const toolsList = properties.tools.map(t => `- \`${t}\``).join('\n');
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 **Infrastructure Deployment Triggered**
+            
+**Enabled Tools:**
+${toolsList}
+
+**Configuration:**
+- Spacelift Auto-Deploy: ${properties.spacelift_auto_deploy ? '✅' : '❌'}
+- Terraform Version: \`${properties.terraform_version}\`
+- Approval Required: ${properties.approval_required ? '✅' : '❌'}
+- Stack Name: \`${properties.stack_name}\`
+
+Monitor progress: ${{ steps.trigger.outputs.manager_run_url }}`
+            });
+
+  # CRITICAL: Wait for manager repo to complete setup
+  wait-for-infrastructure-setup:
+    runs-on: ubuntu-latest
+    needs: [fetch-capabilities, trigger-manager]
+    if: needs.fetch-capabilities.outputs.tools != '[]'
+    timeout-minutes: 30  # Fail if takes too long
+    steps:
+      - name: Wait for Manager Repo Completion
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.MANAGER_REPO_PAT }}
+          script: |
+            const managerRunId = '${{ needs.trigger-manager.outputs.manager_run_id }}';
+            
+            if (!managerRunId) {
+              core.warning('Could not find manager run ID, checking via commit status');
+              
+              // Poll for commit status instead
+              let attempts = 0;
+              const maxAttempts = 60; // 10 minutes with 10s intervals
+              
+              while (attempts < maxAttempts) {
+                const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: context.sha
+                });
+                
+                const infraStatus = statuses.find(s => s.context === 'infra/spacelift-setup');
+                
+                if (infraStatus) {
+                  if (infraStatus.state === 'success') {
+                    core.info('✅ Infrastructure setup completed successfully');
+                    return;
+                  } else if (infraStatus.state === 'failure' || infraStatus.state === 'error') {
+                    core.setFailed('❌ Infrastructure setup failed');
+                    return;
+                  }
+                }
+                
+                core.info(`Waiting for infrastructure setup... (${attempts + 1}/${maxAttempts})`);
+                await new Promise(resolve => setTimeout(resolve, 10000));
+                attempts++;
+              }
+              
+              core.setFailed('Timeout waiting for infrastructure setup');
+              return;
+            }
+            
+            // Poll manager repo run status
+            let attempts = 0;
+            const maxAttempts = 60;
+            
+            while (attempts < maxAttempts) {
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                owner: '${{ vars.MANAGER_REPO_OWNER }}',
+                repo: '${{ vars.MANAGER_REPO_NAME }}',
+                run_id: managerRunId
+              });
+              
+              core.info(`Manager repo status: ${run.status} / ${run.conclusion || 'running'}`);
+              
+              if (run.status === 'completed') {
+                if (run.conclusion === 'success') {
+                  core.info('✅ Infrastructure setup completed successfully');
+                  return;
+                } else {
+                  core.setFailed(`❌ Infrastructure setup failed with conclusion: ${run.conclusion}`);
+                  return;
+                }
+              }
+              
+              await new Promise(resolve => setTimeout(resolve, 10000));
+              attempts++;
+            }
+            
+            core.setFailed('Timeout waiting for infrastructure setup');
+
+  # This job always runs and sets final status
+  infrastructure-setup-status:
+    runs-on: ubuntu-latest
+    needs: [fetch-capabilities, trigger-manager, wait-for-infrastructure-setup]
+    if: always()
+    steps:
+      - name: Set Final Status
+        run: |
+          if [ "${{ needs.wait-for-infrastructure-setup.result }}" == "success" ]; then
+            echo "✅ Infrastructure setup complete - other workflows can proceed"
+            exit 0
+          elif [ "${{ needs.fetch-capabilities.outputs.tools }}" == "[]" ]; then
+            echo "ℹ️ No infrastructure tools enabled - skipping"
+            exit 0
+          else
+            echo "❌ Infrastructure setup failed - blocking other workflows"
+            exit 1
+          fi
+
+  # Job for when no tools are enabled
+  no-infrastructure-tools:
+    runs-on: ubuntu-latest
+    needs: fetch-capabilities
+    if: needs.fetch-capabilities.outputs.tools == '[]'
+    steps:
+      - name: No Infrastructure Tools Enabled
+        run: |
+          echo "ℹ️ No infrastructure tools enabled via custom properties"
+          echo ""
+          echo "To enable infrastructure management, set custom properties on this repository:"
+          echo "  - infrastructure_tools: terraform, ansible, pulumi, etc."
+          echo ""
+          echo "Contact your service provider for more information."

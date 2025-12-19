@@ -1,0 +1,23 @@
+# Terraform files
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variable files from source repos
+source-variables.yml
+source-variables.yaml
+
+# Output files
+outputs.json
+plan-output.txt
+apply-output.txt
+

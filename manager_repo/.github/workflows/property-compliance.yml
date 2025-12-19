@@ -1,0 +1,733 @@
+name: Custom Property Compliance Scanner
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      remediate:
+        description: "Auto-fix drift (low-risk only)"
+        type: boolean
+        default: false
+      severity_filter:
+        description: "Minimum severity to report"
+        type: choice
+        options:
+          - all
+          - medium
+          - high
+          - critical
+        default: all
+      test_mode:
+        description: 'Test mode - scan only N repos'
+        type: choice
+        options:
+          - 'off'
+          - '5'
+          - '10'
+          - '20'
+        default: 'off'
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  COMPLIANCE_CONFIG_PATH: ".github/compliance/config.json"
+
+jobs:
+  scan-compliance:
+    runs-on: ubuntu-latest
+    outputs:
+      violations_count: ${{ steps.scan.outputs.violations_count }}
+      critical_count: ${{ steps.scan.outputs.critical_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load Compliance Configuration
+        id: load-config
+        run: |
+          if [ -f "${{ env.COMPLIANCE_CONFIG_PATH }}" ]; then
+            echo "config_exists=true" >> $GITHUB_OUTPUT
+            cat ${{ env.COMPLIANCE_CONFIG_PATH }} | jq '.' > compliance-config.json
+          else
+            echo "config_exists=false" >> $GITHUB_OUTPUT
+            # Create default config
+            cat > compliance-config.json <<'EOF'
+          {
+            "required_properties": [
+              "infrastructure_tools",
+              "customer_tier",
+              "team_owner"
+            ],
+            "valid_values": {
+              "customer_tier": ["free", "startup", "professional", "enterprise"],
+              "infrastructure_tools": ["terraform", "ansible", "pulumi", "cloudformation", "crossplane"]
+            },
+            "auto_remediate": {
+              "team_owner": true,
+              "missing_required": false
+            },
+            "severity_rules": {
+              "missing_required": "high",
+              "invalid_value": "high",
+              "invalid_team": "critical",
+              "team_mismatch": "medium",
+              "stale_property": "low"
+            }
+          }
+          EOF
+          fi
+
+      - name: Scan All Repositories
+        id: scan
+        uses: actions/github-script@v7
+        env:
+          REMEDIATE: ${{ inputs.remediate || 'false' }}
+          SEVERITY_FILTER: ${{ inputs.severity_filter || 'all' }}
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Load configuration
+            const config = JSON.parse(fs.readFileSync('compliance-config.json', 'utf8'));
+            core.info(`Loaded compliance config: ${JSON.stringify(config, null, 2)}`);
+            
+            const REQUIRED_PROPERTIES = config.required_properties || [];
+            const REQUIRED_FOR_INFRA = config.required_for_infra_repos || [];
+            const VALID_VALUES = config.valid_values || {};
+            const AUTO_REMEDIATE = config.auto_remediate || {};
+            const SEVERITY_RULES = config.severity_rules || {};
+            const CONTENT_DETECTION = config.content_detection_rules || {};
+            
+            // Get all org teams (source of truth for team_owner)
+            core.info('Fetching organization teams...');
+            const { data: teams } = await github.rest.teams.list({
+              org: context.repo.owner,
+              per_page: 100
+            });
+            const validTeams = teams.map(t => t.slug);
+            
+            core.info(`Valid teams: ${validTeams.join(', ')}`);
+            
+            // Get all repositories
+            core.info('Fetching all repositories...');
+            let repos = await github.paginate(
+              github.rest.repos.listForOrg,
+              {
+                org: context.repo.owner,
+                per_page: 100
+              }
+            );
+            
+            // Test mode - limit repos
+            const testMode = '${{ inputs.test_mode }}' || 'off';
+            if (testMode !== 'off') {
+              const limit = parseInt(testMode);
+              core.warning(`🧪 TEST MODE: Limiting scan to ${limit} repositories`);
+              repos = repos.slice(0, limit);
+            }
+            
+            core.info(`Scanning ${repos.length} repositories...`);
+            
+            const violations = [];
+            const fixes = [];
+            const skipped = [];
+            
+            for (const repo of repos) {
+              // Skip archived repos
+              if (repo.archived) {
+                skipped.push({ repo: repo.name, reason: 'archived' });
+                continue;
+              }
+              
+              // Skip this compliance repo itself
+              if (repo.name === context.repo.repo) {
+                skipped.push({ repo: repo.name, reason: 'self' });
+                continue;
+              }
+              
+              core.info(`Scanning: ${repo.name}`);
+              
+              // Get custom properties for this repo
+              let props;
+              try {
+                const { data } = await github.rest.repos.getCustomPropertiesValues({
+                  owner: context.repo.owner,
+                  repo: repo.name
+                });
+                props = data;
+              } catch (error) {
+                core.warning(`Could not fetch properties for ${repo.name}: ${error.message}`);
+                skipped.push({ repo: repo.name, reason: error.message });
+                continue;
+              }
+              
+              // Convert to map for easier lookup
+              const propMap = {};
+              props.forEach(p => {
+                propMap[p.property_name] = p.value;
+              });
+              
+              // Determine if this is an infrastructure repo
+              const contentTypes = propMap.repo_content_type || [];
+              const isInfraRepo = Array.isArray(contentTypes) 
+                ? contentTypes.includes('infra')
+                : contentTypes === 'infra';
+              const isAppRepo = Array.isArray(contentTypes)
+                ? contentTypes.includes('app')
+                : contentTypes === 'app';
+              
+              if (!contentTypes || contentTypes.length === 0) {
+                core.info(`  ⚠️  Repo ${repo.name} has no repo_content_type set`);
+              } else {
+                core.info(`  ℹ️  Repo ${repo.name} content types: ${Array.isArray(contentTypes) ? contentTypes.join(', ') : contentTypes}`);
+              }
+              
+              // Check 1: Missing required properties (all repos)
+              for (const required of REQUIRED_PROPERTIES) {
+                if (!propMap[required]) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'missing_property',
+                    property: required,
+                    severity: SEVERITY_RULES.missing_required || 'high',
+                    message: `Required property '${required}' is not set`
+                  });
+                }
+              }
+              
+              // Check 1b: Missing required properties for infra repos
+              if (isInfraRepo) {
+                for (const required of REQUIRED_FOR_INFRA) {
+                  if (!propMap[required]) {
+                    violations.push({
+                      repo: repo.name,
+                      type: 'missing_property',
+                      property: required,
+                      severity: SEVERITY_RULES.missing_required || 'high',
+                      message: `Required infrastructure property '${required}' is not set (repo has 'infra' content)`
+                    });
+                  }
+                }
+              } else if (contentTypes && contentTypes.length > 0) {
+                // App-only repo - skip infrastructure checks
+                core.info(`  ⏭️  Skipping infrastructure checks for app-only repo: ${repo.name}`);
+              }
+              
+              // Check 2: Invalid property values
+              for (const [prop, validValues] of Object.entries(VALID_VALUES)) {
+                if (propMap[prop]) {
+                  const value = Array.isArray(propMap[prop]) ? propMap[prop] : [propMap[prop]];
+                  const invalidValues = value.filter(v => !validValues.includes(v));
+                  
+                  if (invalidValues.length > 0) {
+                    violations.push({
+                      repo: repo.name,
+                      type: 'invalid_value',
+                      property: prop,
+                      current_value: propMap[prop],
+                      invalid_values: invalidValues,
+                      valid_values: validValues,
+                      severity: SEVERITY_RULES.invalid_value || 'high',
+                      message: `Property '${prop}' has invalid value(s): ${invalidValues.join(', ')}`
+                    });
+                  }
+                }
+              }
+              
+              // Check 3: team_owner validation
+              if (propMap.team_owner) {
+                // Check if team exists in org
+                if (!validTeams.includes(propMap.team_owner)) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'invalid_team',
+                    property: 'team_owner',
+                    current_value: propMap.team_owner,
+                    valid_teams: validTeams.slice(0, 10), // Limit for readability
+                    severity: SEVERITY_RULES.invalid_team || 'critical',
+                    message: `Team '${propMap.team_owner}' does not exist in organization`
+                  });
+                  
+                  // Auto-remediation: Find repo's actual team
+                  if (process.env.REMEDIATE === 'true' && AUTO_REMEDIATE.team_owner) {
+                    try {
+                      const { data: repoTeams } = await github.rest.repos.listTeams({
+                        owner: context.repo.owner,
+                        repo: repo.name,
+                        per_page: 10
+                      });
+                      
+                      if (repoTeams.length > 0) {
+                        const actualTeam = repoTeams[0].slug;
+                        
+                        // Update property
+                        await github.rest.repos.createOrUpdateCustomPropertiesValues({
+                          owner: context.repo.owner,
+                          repo: repo.name,
+                          properties: [
+                            {
+                              property_name: 'team_owner',
+                              value: actualTeam
+                            }
+                          ]
+                        });
+                        
+                        fixes.push({
+                          repo: repo.name,
+                          property: 'team_owner',
+                          old_value: propMap.team_owner,
+                          new_value: actualTeam,
+                          reason: 'Team does not exist, set to actual repo team'
+                        });
+                        
+                        core.info(`✅ Fixed team_owner for ${repo.name}: ${propMap.team_owner} → ${actualTeam}`);
+                      }
+                    } catch (error) {
+                      core.warning(`Could not auto-fix team_owner for ${repo.name}: ${error.message}`);
+                    }
+                  }
+                } else {
+                  // Team exists, but verify repo actually has this team assigned
+                  try {
+                    const { data: repoTeams } = await github.rest.repos.listTeams({
+                      owner: context.repo.owner,
+                      repo: repo.name
+                    });
+                    
+                    const hasTeamAccess = repoTeams.some(t => t.slug === propMap.team_owner);
+                    
+                    if (!hasTeamAccess) {
+                      violations.push({
+                        repo: repo.name,
+                        type: 'team_mismatch',
+                        property: 'team_owner',
+                        current_value: propMap.team_owner,
+                        actual_teams: repoTeams.map(t => t.slug),
+                        severity: SEVERITY_RULES.team_mismatch || 'medium',
+                        message: `Property says '${propMap.team_owner}' but team doesn't have repo access`
+                      });
+                    }
+                  } catch (error) {
+                    core.warning(`Could not verify team access for ${repo.name}: ${error.message}`);
+                  }
+                }
+              }
+              
+              // Check 4: Content type mismatch detection
+              core.info(`  🔍 Detecting actual repository structure...`);
+              
+              try {
+                // Get repository contents (root level)
+                const { data: contents } = await github.rest.repos.getContent({
+                  owner: context.repo.owner,
+                  repo: repo.name,
+                  path: ''
+                });
+                
+                const directories = contents
+                  .filter(item => item.type === 'dir')
+                  .map(item => item.name);
+                
+                core.info(`  📁 Directories: ${directories.join(', ')}`);
+                
+                // Detect infrastructure content
+                const infraIndicators = CONTENT_DETECTION.infra_indicators || [];
+                const hasInfraDir = directories.some(dir => 
+                  infraIndicators.includes(dir.toLowerCase())
+                );
+                
+                // Detect application content
+                const appIndicators = CONTENT_DETECTION.app_indicators || [];
+                const hasAppDir = directories.some(dir =>
+                  appIndicators.includes(dir.toLowerCase())
+                );
+                
+                core.info(`  🔍 Detected: ${hasAppDir ? 'app' : ''} ${hasInfraDir ? 'infra' : ''}`);
+                
+                // Compare with declared content type
+                const declaredTypes = Array.isArray(contentTypes) ? contentTypes : (contentTypes ? [contentTypes] : []);
+                const declaredHasInfra = declaredTypes.includes('infra');
+                const declaredHasApp = declaredTypes.includes('app');
+                
+                // Check for mismatches
+                let needsUpdate = false;
+                let suggestedTypes = [...declaredTypes];
+                
+                // Case 1: Has infra content but not declared
+                if (hasInfraDir && !declaredHasInfra) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'content_type_mismatch',
+                    property: 'repo_content_type',
+                    severity: SEVERITY_RULES.content_type_mismatch_add || 'high',
+                    message: `Repository has infrastructure directories but repo_content_type does not include "infra"`,
+                    detected_content: { hasInfra: true, hasApp: hasAppDir },
+                    declared_content: declaredTypes,
+                    auto_fix_available: AUTO_REMEDIATE.content_type_add_detected
+                  });
+                  
+                  if (!suggestedTypes.includes('infra')) {
+                    suggestedTypes.push('infra');
+                  }
+                  needsUpdate = true;
+                  
+                  // Auto-remediation: Add "infra" type
+                  if (process.env.REMEDIATE === 'true' && AUTO_REMEDIATE.content_type_add_detected) {
+                    try {
+                      await github.rest.repos.createOrUpdateCustomPropertiesValues({
+                        owner: context.repo.owner,
+                        repo: repo.name,
+                        properties: [
+                          {
+                            property_name: 'repo_content_type',
+                            value: suggestedTypes
+                          }
+                        ]
+                      });
+                      
+                      fixes.push({
+                        repo: repo.name,
+                        property: 'repo_content_type',
+                        old_value: declaredTypes,
+                        new_value: suggestedTypes,
+                        reason: 'Infrastructure directories detected, added "infra" to content type'
+                      });
+                      
+                      core.info(`  ✅ Auto-fixed: Added "infra" to ${repo.name} content type`);
+                    } catch (error) {
+                      core.warning(`  ⚠️  Could not auto-fix content type for ${repo.name}: ${error.message}`);
+                    }
+                  }
+                }
+                
+                // Case 2: Has app content but not declared
+                if (hasAppDir && !declaredHasApp) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'content_type_mismatch',
+                    property: 'repo_content_type',
+                    severity: SEVERITY_RULES.content_type_mismatch_add || 'high',
+                    message: `Repository has application directories but repo_content_type does not include "app"`,
+                    detected_content: { hasInfra: hasInfraDir, hasApp: true },
+                    declared_content: declaredTypes,
+                    auto_fix_available: AUTO_REMEDIATE.content_type_add_detected
+                  });
+                  
+                  if (!suggestedTypes.includes('app')) {
+                    suggestedTypes.push('app');
+                  }
+                  needsUpdate = true;
+                  
+                  // Auto-remediation: Add "app" type
+                  if (process.env.REMEDIATE === 'true' && AUTO_REMEDIATE.content_type_add_detected && !needsUpdate) {
+                    try {
+                      await github.rest.repos.createOrUpdateCustomPropertiesValues({
+                        owner: context.repo.owner,
+                        repo: repo.name,
+                        properties: [
+                          {
+                            property_name: 'repo_content_type',
+                            value: suggestedTypes
+                          }
+                        ]
+                      });
+                      
+                      fixes.push({
+                        repo: repo.name,
+                        property: 'repo_content_type',
+                        old_value: declaredTypes,
+                        new_value: suggestedTypes,
+                        reason: 'Application directories detected, added "app" to content type'
+                      });
+                      
+                      core.info(`  ✅ Auto-fixed: Added "app" to ${repo.name} content type`);
+                    } catch (error) {
+                      core.warning(`  ⚠️  Could not auto-fix content type for ${repo.name}: ${error.message}`);
+                    }
+                  }
+                }
+                
+                // Case 3: Declared infra but no infra content found (suggest removal, don't auto-fix)
+                if (declaredHasInfra && !hasInfraDir) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'content_type_stale',
+                    property: 'repo_content_type',
+                    severity: SEVERITY_RULES.content_type_mismatch_remove || 'medium',
+                    message: `repo_content_type includes "infra" but no infrastructure directories found`,
+                    detected_content: { hasInfra: false, hasApp: hasAppDir },
+                    declared_content: declaredTypes,
+                    suggestion: 'Consider removing "infra" if infrastructure was removed',
+                    auto_fix_available: false
+                  });
+                }
+                
+                // Case 4: Declared app but no app content found (suggest removal, don't auto-fix)
+                if (declaredHasApp && !hasAppDir) {
+                  violations.push({
+                    repo: repo.name,
+                    type: 'content_type_stale',
+                    property: 'repo_content_type',
+                    severity: SEVERITY_RULES.content_type_mismatch_remove || 'medium',
+                    message: `repo_content_type includes "app" but no application directories found`,
+                    detected_content: { hasInfra: hasInfraDir, hasApp: false },
+                    declared_content: declaredTypes,
+                    suggestion: 'Consider removing "app" if application code was removed',
+                    auto_fix_available: false
+                  });
+                }
+                
+              } catch (error) {
+                core.warning(`  ⚠️  Could not detect structure for ${repo.name}: ${error.message}`);
+              }
+            }
+            
+            // Filter by severity if specified
+            let filteredViolations = violations;
+            const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, all: 99 };
+            const filterLevel = severityOrder[process.env.SEVERITY_FILTER] || 99;
+            
+            if (filterLevel < 99) {
+              filteredViolations = violations.filter(v => {
+                return severityOrder[v.severity] <= filterLevel;
+              });
+            }
+            
+            // Generate statistics
+            const bySeverity = {
+              critical: violations.filter(v => v.severity === 'critical'),
+              high: violations.filter(v => v.severity === 'high'),
+              medium: violations.filter(v => v.severity === 'medium'),
+              low: violations.filter(v => v.severity === 'low')
+            };
+            
+            // Console output
+            core.info(`\n${'='.repeat(70)}`);
+            core.info(`COMPLIANCE SCAN COMPLETE`);
+            core.info(`${'='.repeat(70)}`);
+            core.info(`Repositories scanned: ${repos.length}`);
+            core.info(`Repositories skipped: ${skipped.length}`);
+            core.info(`Total violations: ${violations.length}`);
+            core.info(`  - Critical: ${bySeverity.critical.length}`);
+            core.info(`  - High: ${bySeverity.high.length}`);
+            core.info(`  - Medium: ${bySeverity.medium.length}`);
+            core.info(`  - Low: ${bySeverity.low.length}`);
+            core.info(`Fixes applied: ${fixes.length}`);
+            core.info(`${'='.repeat(70)}`);
+            
+            // Write detailed report
+            const report = {
+              scan_date: new Date().toISOString(),
+              config: config,
+              statistics: {
+                total_repos: repos.length,
+                scanned: repos.length - skipped.length,
+                skipped: skipped.length,
+                violations_count: violations.length,
+                violations_by_severity: {
+                  critical: bySeverity.critical.length,
+                  high: bySeverity.high.length,
+                  medium: bySeverity.medium.length,
+                  low: bySeverity.low.length
+                },
+                fixes_count: fixes.length
+              },
+              violations: violations,
+              fixes: fixes,
+              skipped: skipped
+            };
+            
+            fs.writeFileSync('compliance-report.json', JSON.stringify(report, null, 2));
+            
+            // Set outputs
+            core.setOutput('violations_count', violations.length);
+            core.setOutput('critical_count', bySeverity.critical.length);
+            core.setOutput('high_count', bySeverity.high.length);
+            core.setOutput('medium_count', bySeverity.medium.length);
+            core.setOutput('fixes_count', fixes.length);
+            
+            return report;
+
+      - name: Generate Compliance Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('compliance-report.json', 'utf8'));
+            
+            const { statistics, violations, fixes } = report;
+            const { violations_by_severity } = statistics;
+            
+            let summary = '# 🔍 Custom Property Compliance Report\n\n';
+            summary += `**Scan Date:** ${new Date(report.scan_date).toLocaleString()}\n\n`;
+            
+            // Statistics table
+            summary += '## 📊 Statistics\n\n';
+            summary += '| Metric | Count |\n';
+            summary += '|--------|-------|\n';
+            summary += `| Repositories Scanned | ${statistics.scanned} |\n`;
+            summary += `| Total Violations | ${statistics.violations_count} |\n`;
+            summary += `| Critical Severity | ${violations_by_severity.critical} |\n`;
+            summary += `| High Severity | ${violations_by_severity.high} |\n`;
+            summary += `| Medium Severity | ${violations_by_severity.medium} |\n`;
+            summary += `| Low Severity | ${violations_by_severity.low} |\n`;
+            summary += `| Auto-Fixes Applied | ${statistics.fixes_count} |\n\n`;
+            
+            // Violations by severity
+            if (statistics.violations_count > 0) {
+              summary += '## 🚨 Violations\n\n';
+              
+              if (violations_by_severity.critical > 0) {
+                summary += `### 🔴 Critical (${violations_by_severity.critical})\n\n`;
+                const criticalViolations = violations.filter(v => v.severity === 'critical');
+                criticalViolations.forEach(v => {
+                  summary += `- **${v.repo}**: ${v.message}\n`;
+                  if (v.current_value) {
+                    summary += `  - Current value: \`${v.current_value}\`\n`;
+                  }
+                });
+                summary += '\n';
+              }
+              
+              if (violations_by_severity.high > 0) {
+                summary += `### 🟠 High (${violations_by_severity.high})\n\n`;
+                const highViolations = violations.filter(v => v.severity === 'high');
+                highViolations.slice(0, 20).forEach(v => {
+                  summary += `- **${v.repo}**: ${v.message}\n`;
+                });
+                if (highViolations.length > 20) {
+                  summary += `\n... and ${highViolations.length - 20} more high severity violations\n`;
+                }
+                summary += '\n';
+              }
+              
+              if (violations_by_severity.medium > 0) {
+                summary += `### 🟡 Medium (${violations_by_severity.medium})\n\n`;
+                const mediumViolations = violations.filter(v => v.severity === 'medium');
+                mediumViolations.slice(0, 10).forEach(v => {
+                  summary += `- **${v.repo}**: ${v.message}\n`;
+                });
+                if (mediumViolations.length > 10) {
+                  summary += `\n... and ${mediumViolations.length - 10} more medium severity violations\n`;
+                }
+                summary += '\n';
+              }
+            } else {
+              summary += '## ✅ No Violations Found\n\n';
+              summary += 'All repositories are compliant with custom property policies!\n\n';
+            }
+            
+            // Auto-fixes section
+            if (fixes.length > 0) {
+              summary += `## 🔧 Auto-Fixes Applied (${fixes.length})\n\n`;
+              fixes.forEach(f => {
+                summary += `- **${f.repo}**: ${f.property} = \`${f.old_value}\` → \`${f.new_value}\`\n`;
+                summary += `  - Reason: ${f.reason}\n`;
+              });
+              summary += '\n';
+            }
+            
+            // Remediation section
+            if (statistics.violations_count > 0) {
+              summary += '## 🛠️ Remediation Guide\n\n';
+              summary += '### For Critical/High Violations:\n\n';
+              summary += '1. Review the violations above\n';
+              summary += '2. Update custom properties in affected repositories\n';
+              summary += '3. Re-run this workflow to verify fixes\n\n';
+              summary += '### Auto-Remediation:\n\n';
+              summary += 'Run this workflow with `remediate: true` to auto-fix low-risk issues like:\n';
+              summary += '- Invalid team_owner (will set to actual repo team)\n';
+              summary += '- Other safe property corrections\n\n';
+              summary += '⚠️ **Warning**: Auto-remediation will modify repository properties!\n\n';
+            }
+            
+            // Footer
+            summary += '---\n\n';
+            summary += `[View full report](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
+            
+            fs.writeFileSync('compliance-summary.md', summary);
+            
+            return summary;
+
+      - name: Create or Update Compliance Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('compliance-summary.md', 'utf8');
+            const report = JSON.parse(fs.readFileSync('compliance-report.json', 'utf8'));
+            
+            const violations_count = report.statistics.violations_count;
+            const critical_count = report.statistics.violations_by_severity.critical;
+            
+            // Find existing compliance issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'compliance,custom-properties',
+              per_page: 1
+            });
+            
+            if (violations_count > 0) {
+              const title = critical_count > 0
+                ? `🚨 CRITICAL: Custom Property Compliance Violations (${violations_count})`
+                : `⚠️ Custom Property Compliance Violations (${violations_count})`;
+              
+              const labels = ['compliance', 'custom-properties'];
+              if (critical_count > 0) labels.push('critical');
+              if (report.statistics.violations_by_severity.high > 0) labels.push('high-priority');
+              
+              if (issues.data.length > 0) {
+                // Update existing issue
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issues.data[0].number,
+                  title: title,
+                  body: summary,
+                  labels: labels
+                });
+                core.info(`📝 Updated compliance issue #${issues.data[0].number}`);
+              } else {
+                // Create new issue
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: title,
+                  body: summary,
+                  labels: labels
+                });
+                core.info(`📝 Created compliance issue #${issue.data.number}`);
+              }
+            } else if (issues.data.length > 0) {
+              // Close existing issue if no violations
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                state: 'closed',
+                body: summary + '\n\n✅ All violations resolved!'
+              });
+              core.info(`✅ Closed compliance issue #${issues.data[0].number} - no violations`);
+            }
+
+      - name: Upload Compliance Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report-${{ github.run_id }}
+          path: |
+            compliance-report.json
+            compliance-summary.md
+
+      - name: Fail on Critical Violations
+        if: steps.scan.outputs.critical_count > 0
+        run: |
+          echo "❌ ${{ steps.scan.outputs.critical_count }} critical compliance violations found!"
+          echo "Review the compliance issue created in this repository."
+          exit 1
+

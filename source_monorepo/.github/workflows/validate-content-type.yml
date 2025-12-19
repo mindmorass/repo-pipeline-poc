@@ -1,0 +1,301 @@
+name: Validate Repository Content Type
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  detect-structure:
+    runs-on: ubuntu-latest
+    outputs:
+      has_infra: ${{ steps.detect.outputs.has_infra }}
+      has_app: ${{ steps.detect.outputs.has_app }}
+      needs_update: ${{ steps.validate.outputs.needs_update }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better detection
+      
+      - name: Detect Repository Structure
+        id: detect
+        run: |
+          echo "🔍 Detecting repository structure..."
+          
+          HAS_INFRA=false
+          HAS_APP=false
+          
+          # Check for infrastructure directories
+          if [ -d "infra" ] || [ -d "terraform" ] || [ -d "ansible" ] || \
+             [ -d "kubernetes" ] || [ -d "k8s" ] || [ -d "helm" ] || \
+             [ -d "cloudformation" ] || [ -d "pulumi" ]; then
+            HAS_INFRA=true
+            echo "  ✓ Found infrastructure directories"
+          fi
+          
+          # Check for infrastructure files
+          if find . -name "*.tf" -o -name "*.tfvars" -o -name "ansible.cfg" | grep -q .; then
+            HAS_INFRA=true
+            echo "  ✓ Found infrastructure files"
+          fi
+          
+          # Check for application directories
+          if [ -d "app" ] || [ -d "src" ] || [ -d "frontend" ] || \
+             [ -d "backend" ] || [ -d "services" ] || [ -d "packages" ] || \
+             [ -d "lib" ] || [ -d "components" ]; then
+            HAS_APP=true
+            echo "  ✓ Found application directories"
+          fi
+          
+          echo "has_infra=$HAS_INFRA" >> $GITHUB_OUTPUT
+          echo "has_app=$HAS_APP" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "Detected structure:"
+          echo "  - Infrastructure: $HAS_INFRA"
+          echo "  - Application: $HAS_APP"
+      
+      - name: Fetch Current Property
+        id: fetch-prop
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data: props } = await github.rest.repos.getCustomPropertiesValues({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              
+              const contentTypeProp = props.find(p => p.property_name === 'repo_content_type');
+              const current = contentTypeProp?.value || [];
+              
+              core.setOutput('current_types', JSON.stringify(current));
+              core.info(`Current repo_content_type: ${JSON.stringify(current)}`);
+              
+              return current;
+            } catch (error) {
+              core.warning(`Could not fetch custom properties: ${error.message}`);
+              core.setOutput('current_types', '[]');
+              return [];
+            }
+      
+      - name: Validate Content Type Matches Structure
+        id: validate
+        uses: actions/github-script@v7
+        env:
+          HAS_INFRA: ${{ steps.detect.outputs.has_infra }}
+          HAS_APP: ${{ steps.detect.outputs.has_app }}
+          CURRENT_TYPES: ${{ steps.fetch-prop.outputs.current_types }}
+        with:
+          script: |
+            const hasInfra = process.env.HAS_INFRA === 'true';
+            const hasApp = process.env.HAS_APP === 'true';
+            const current = JSON.parse(process.env.CURRENT_TYPES || '[]');
+            
+            const currentHasInfra = current.includes('infra');
+            const currentHasApp = current.includes('app');
+            
+            // Build expected property
+            const expected = [];
+            if (hasApp) expected.push('app');
+            if (hasInfra) expected.push('infra');
+            
+            // Check for mismatch
+            const needsUpdate = 
+              (hasInfra !== currentHasInfra) || 
+              (hasApp !== currentHasApp);
+            
+            core.setOutput('needs_update', needsUpdate);
+            core.setOutput('expected_types', JSON.stringify(expected));
+            
+            if (needsUpdate) {
+              core.warning('⚠️ Content type mismatch detected!');
+              core.warning(`  Current: ${JSON.stringify(current)}`);
+              core.warning(`  Expected: ${JSON.stringify(expected)}`);
+              
+              return {
+                needsUpdate: true,
+                current,
+                expected,
+                hasInfra,
+                hasApp
+              };
+            } else {
+              core.info('✅ Content type matches repository structure');
+              return {
+                needsUpdate: false,
+                current,
+                expected
+              };
+            }
+  
+  create-update-pr:
+    needs: detect-structure
+    if: needs.detect-structure.outputs.needs_update == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Issue for Property Update
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hasInfra = '${{ needs.detect-structure.outputs.has_infra }}' === 'true';
+            const hasApp = '${{ needs.detect-structure.outputs.has_app }}' === 'true';
+            
+            const expected = [];
+            if (hasApp) expected.push('app');
+            if (hasInfra) expected.push('infra');
+            
+            const title = '🔄 Update repo_content_type Property';
+            
+            // Check if issue already exists
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'property-update,automated'
+            });
+            
+            const existingIssue = existingIssues.find(issue => issue.title === title);
+            
+            const body = `## ⚠️ Repository Structure Changed
+
+The repository structure has changed and the \`repo_content_type\` custom property needs to be updated.
+
+### Current Status
+
+**Detected Structure:**
+${hasApp ? '- ✅ Application code found' : '- ❌ No application code'}
+${hasInfra ? '- ✅ Infrastructure code found' : '- ❌ No infrastructure code'}
+
+**Expected \`repo_content_type\`:** \`${JSON.stringify(expected)}\`
+
+### Action Required
+
+Update the custom property using the GitHub CLI:
+
+\`\`\`bash
+gh api repos/${context.repo.owner}/${context.repo.repo}/properties/values -X PUT \\
+  -f properties[][property_name]='repo_content_type'${expected.map(t => ` \\\n  -f properties[][value][]='${t}'`).join('')}
+\`\`\`
+
+Or via the GitHub web UI:
+1. Go to repository Settings
+2. Navigate to Custom Properties
+3. Set \`repo_content_type\` to: ${expected.map(t => `\`${t}\``).join(', ')}
+
+### Why This Matters
+
+- ✅ Ensures compliance scanning works correctly
+- ✅ Triggers appropriate workflows
+- ✅ Accurate reporting and filtering
+${hasInfra ? '- ✅ Enables infrastructure deployment automation' : ''}
+
+### Detected Changes
+
+This was triggered by commit: ${context.sha.substring(0, 7)}
+Branch: ${context.ref}
+${context.payload.pull_request ? `Pull Request: #${context.payload.pull_request.number}` : ''}
+
+---
+
+*This issue was automatically created by the repository structure validation workflow.*
+*It will be closed automatically once the property is updated.*
+`;
+
+            if (existingIssue) {
+              // Update existing issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: body
+              });
+              
+              core.info(`📝 Updated existing issue #${existingIssue.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['property-update', 'automated', 'infrastructure']
+              });
+              
+              core.info(`📝 Created issue #${issue.data.number}`);
+            }
+      
+      - name: Add PR Comment (if PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hasInfra = '${{ needs.detect-structure.outputs.has_infra }}' === 'true';
+            const hasApp = '${{ needs.detect-structure.outputs.has_app }}' === 'true';
+            
+            const expected = [];
+            if (hasApp) expected.push('app');
+            if (hasInfra) expected.push('infra');
+            
+            const comment = `## ⚠️ Content Type Update Required
+
+This PR changes the repository structure. The \`repo_content_type\` property needs to be updated.
+
+**Expected value:** \`${JSON.stringify(expected)}\`
+
+Update command:
+\`\`\`bash
+gh api repos/${context.repo.owner}/${context.repo.repo}/properties/values -X PUT \\
+  -f properties[][property_name]='repo_content_type'${expected.map(t => ` \\\n  -f properties[][value][]='${t}'`).join('')}
+\`\`\`
+
+See the [automated issue](https://github.com/${context.repo.owner}/${context.repo.repo}/issues?q=is%3Aissue+is%3Aopen+label%3Aproperty-update) for more details.
+`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+  
+  check-and-close-issue:
+    needs: detect-structure
+    if: needs.detect-structure.outputs.needs_update == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close Property Update Issue if Exists
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Find open property-update issues
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'property-update,automated'
+            });
+            
+            for (const issue of issues) {
+              if (issue.title.includes('repo_content_type')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+                
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: '✅ Property has been updated and now matches the repository structure. Closing automatically.'
+                });
+                
+                core.info(`✅ Closed issue #${issue.number}`);
+              }
+            }
+

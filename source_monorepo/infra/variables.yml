@@ -1,0 +1,27 @@
+# Variables for infrastructure deployment
+# These will be passed to the manager repo
+
+project_name: my-application
+cloud_provider: aws
+
+environments:
+  staging:
+    region: us-east-1
+    instance_type: t3.micro
+    min_instances: 1
+    max_instances: 2
+
+  production:
+    region: us-east-1
+    instance_type: t3.small
+    min_instances: 2
+    max_instances: 10
+
+networking:
+  vpc_cidr: "10.0.0.0/16"
+  availability_zones: 2
+
+tags:
+  managed_by: manager-repo
+  team: platform
+  cost_center: engineering

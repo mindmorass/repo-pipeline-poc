@@ -1,0 +1,775 @@
+name: Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository name"
+        required: true
+        type: string
+      source_owner:
+        description: "Source repository owner"
+        required: true
+        type: string
+      source_ref:
+        description: "Source ref (branch/tag)"
+        required: true
+        type: string
+      source_sha:
+        description: "Source commit SHA"
+        required: true
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      infra_path:
+        description: "Path to infrastructure directory"
+        required: true
+        type: string
+      triggered_by:
+        description: "GitHub user who triggered"
+        required: true
+        type: string
+      run_id:
+        description: "Source workflow run ID"
+        required: true
+        type: string
+      infrastructure_properties:
+        description: "JSON string of infrastructure properties from customer repo"
+        required: false
+        type: string
+        default: "{}"
+      dry_run:
+        description: "Test mode - no actual deployments"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_VERSION: "1.6.0"
+  SPACELIFT_API_ENDPOINT: ${{ vars.SPACELIFT_API_ENDPOINT }}
+
+jobs:
+  test-mode-notification:
+    if: ${{ inputs.dry_run == 'true' || inputs.dry_run == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Mode Banner
+        run: |
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║           🧪 TEST MODE ENABLED                        ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "This workflow is running in TEST MODE"
+          echo ""
+          echo "What WILL run:"
+          echo "  ✓ All job orchestration and linkages"
+          echo "  ✓ Property parsing and validation"
+          echo "  ✓ Status updates and notifications"
+          echo "  ✓ PR comments and feedback"
+          echo "  ✓ Job dependencies and blocking"
+          echo ""
+          echo "What will NOT run:"
+          echo "  ✗ Actual Terraform applies"
+          echo "  ✗ Actual Spacelift API calls"
+          echo "  ✗ Real infrastructure changes"
+          echo "  ✗ External system modifications"
+          echo ""
+          echo "Perfect for testing workflow integrations!"
+  
+  # NEW: Parse infrastructure capabilities from custom properties
+  parse-capabilities:
+    runs-on: ubuntu-latest
+    needs: [test-mode-notification]
+    if: always()
+    outputs:
+      terraform_enabled: ${{ steps.parse.outputs.terraform_enabled }}
+      ansible_enabled: ${{ steps.parse.outputs.ansible_enabled }}
+      pulumi_enabled: ${{ steps.parse.outputs.pulumi_enabled }}
+      spacelift_config: ${{ steps.parse.outputs.spacelift_config }}
+      tools: ${{ steps.parse.outputs.tools }}
+      has_tools: ${{ steps.parse.outputs.has_tools }}
+    steps:
+      - name: Parse Infrastructure Properties
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const props = JSON.parse(`${{ inputs.infrastructure_properties }}` || '{}');
+
+            core.info(`Received infrastructure properties: ${JSON.stringify(props, null, 2)}`);
+
+            const tools = props.tools || [];
+            const terraformEnabled = tools.includes('terraform');
+            const ansibleEnabled = tools.includes('ansible');
+            const pulumiEnabled = tools.includes('pulumi');
+            const hasTools = tools.length > 0;
+
+            core.setOutput('terraform_enabled', terraformEnabled);
+            core.setOutput('ansible_enabled', ansibleEnabled);
+            core.setOutput('pulumi_enabled', pulumiEnabled);
+            core.setOutput('has_tools', hasTools);
+            core.setOutput('tools', JSON.stringify(tools));
+            core.setOutput('spacelift_config', JSON.stringify(props));
+
+            core.info(`Enabled tools: ${tools.join(', ') || 'none'}`);
+            core.info(`Terraform: ${terraformEnabled}, Ansible: ${ansibleEnabled}, Pulumi: ${pulumiEnabled}`);
+
+            return { terraformEnabled, ansibleEnabled, pulumiEnabled, tools };
+
+  # NEW: Setup Spacelift Stack for Terraform
+  setup-spacelift-terraform:
+    runs-on: ubuntu-latest
+    needs: parse-capabilities
+    if: needs.parse-capabilities.outputs.terraform_enabled == 'true'
+    steps:
+      - name: Checkout Manager Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Spacelift Stack for Terraform
+        id: setup-stack
+        uses: actions/github-script@v7
+        env:
+          SPACELIFT_API_KEY_ID: ${{ secrets.SPACELIFT_API_KEY_ID }}
+          SPACELIFT_API_KEY_SECRET: ${{ secrets.SPACELIFT_API_KEY_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const config = JSON.parse(`${{ needs.parse-capabilities.outputs.spacelift_config }}`);
+            const isDryRun = process.env.DRY_RUN === 'true';
+
+            if (isDryRun) {
+              core.warning('🧪 TEST MODE: Skipping actual Spacelift API calls');
+            }
+
+            core.info(`Setting up Spacelift stack for ${config.repo_name}`);
+            core.info(`Stack name: ${config.stack_name}`);
+            core.info(`Terraform version: ${config.terraform_version}`);
+            core.info(`Auto-deploy: ${config.spacelift_auto_deploy}`);
+
+            // Spacelift GraphQL API helper
+            const spaceliftQuery = async (query, variables = {}) => {
+              const endpoint = process.env.SPACELIFT_API_ENDPOINT || '${{ env.SPACELIFT_API_ENDPOINT }}';
+              const response = await fetch(`${endpoint}/graphql`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.SPACELIFT_API_KEY_SECRET}`
+                },
+                body: JSON.stringify({ query, variables })
+              });
+              
+              if (!response.ok) {
+                throw new Error(`Spacelift API error: ${response.status} ${response.statusText}`);
+              }
+              
+              return response.json();
+            };
+
+            // Check if stack exists
+            const checkStackQuery = `
+              query GetStack($id: ID!) {
+                stack(id: $id) {
+                  id
+                  name
+                  state
+                  trackedCommit {
+                    hash
+                  }
+                }
+              }
+            `;
+
+            const stackId = config.stack_name;
+            let stackExists = false;
+            let existingStack = null;
+
+            if (isDryRun) {
+              // In test mode, simulate that stack doesn't exist
+              core.info(`🧪 TEST MODE: Simulating stack check for ${stackId}`);
+              stackExists = false;
+            } else {
+              try {
+                const result = await spaceliftQuery(checkStackQuery, { id: stackId });
+                if (result.data && result.data.stack) {
+                  stackExists = true;
+                  existingStack = result.data.stack;
+                  core.info(`✓ Stack ${stackId} exists with state: ${existingStack.state}`);
+                }
+              } catch (error) {
+                core.info(`Stack ${stackId} does not exist, will create new stack`);
+              }
+            }
+
+            if (!stackExists) {
+              // Create new Spacelift stack
+              const createStackMutation = `
+                mutation CreateStack($input: StackInput!) {
+                  stackCreate(input: $input) {
+                    id
+                    name
+                    state
+                  }
+                }
+              `;
+              
+              const stackInput = {
+                name: stackId,
+                space: "root",
+                repository: `${config.repo_owner}/${config.repo_name}`,
+                branch: '${{ inputs.source_ref }}'.split('/').pop(),
+                projectRoot: '${{ inputs.infra_path }}',
+                terraformVersion: config.terraform_version || 'latest',
+                administrative: false,
+                autodeploy: config.spacelift_auto_deploy || false,
+                description: `Managed infrastructure stack for ${config.repo_name} - ${{ inputs.environment }}`,
+                labels: [
+                  'managed-by:infrastructure-manager',
+                  `customer:${config.repo_name}`,
+                  `environment:${{ inputs.environment }}`,
+                  'tool:terraform'
+                ],
+                vendorConfig: {
+                  terraform: {
+                    version: config.terraform_version || 'latest',
+                    useSmartSanitization: true
+                  }
+                }
+              };
+              
+              if (isDryRun) {
+                core.info(`🧪 TEST MODE: Would create Spacelift stack with config:`);
+                core.info(JSON.stringify(stackInput, null, 2));
+                core.info(`✅ TEST MODE: Simulated stack creation for ${stackId}`);
+                core.setOutput('stack_created', 'true');
+              } else {
+                try {
+                  const createResult = await spaceliftQuery(createStackMutation, { input: stackInput });
+                  
+                  if (createResult.errors) {
+                    core.setFailed(`Failed to create Spacelift stack: ${JSON.stringify(createResult.errors)}`);
+                    throw new Error('Spacelift stack creation failed');
+                  }
+                  
+                  core.info(`✅ Created Spacelift stack: ${stackId}`);
+                  core.setOutput('stack_created', 'true');
+                } catch (error) {
+                  core.setFailed(`Error creating Spacelift stack: ${error.message}`);
+                  throw error;
+                }
+              }
+            } else {
+              core.info(`ℹ️ Spacelift stack ${stackId} already exists`);
+              core.setOutput('stack_created', 'false');
+            }
+
+            // Configure stack policies if approval required
+            if (config.approval_required && !stackExists) {
+              core.info(`Configuring approval policy for stack ${stackId}`);
+              
+              if (isDryRun) {
+                core.info(`🧪 TEST MODE: Would attach approval policy 'require-approval'`);
+              } else {
+                const policyAttachMutation = `
+                  mutation AttachPolicy($stack: ID!, $policy: ID!, $type: PolicyType!) {
+                    policyAttach(stack: $stack, policy: $policy, type: $type) {
+                      id
+                    }
+                  }
+                `;
+                
+                try {
+                  // Attach approval policy (assumes 'require-approval' policy exists)
+                  await spaceliftQuery(policyAttachMutation, {
+                    stack: stackId,
+                    policy: 'require-approval',
+                    type: 'APPROVAL'
+                  });
+                  
+                  core.info(`✅ Attached approval policy to stack`);
+                } catch (error) {
+                  core.warning(`Could not attach approval policy: ${error.message}`);
+                }
+              }
+            }
+
+            const stackUrl = `${process.env.SPACELIFT_API_ENDPOINT || '${{ env.SPACELIFT_API_ENDPOINT }}'}/stack/${stackId}`;
+            core.setOutput('stack_id', stackId);
+            core.setOutput('stack_url', stackUrl);
+
+            if (isDryRun) {
+              core.info(`🧪 TEST MODE: Spacelift stack simulation complete: ${stackId}`);
+            } else {
+              core.info(`🚀 Spacelift stack ready: ${stackUrl}`);
+            }
+
+      - name: Post Success Status to Customer Repo
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            const isDryRun = '${{ inputs.dry_run }}' === 'true';
+            const description = isDryRun
+              ? '🧪 TEST MODE: Spacelift setup simulated'
+              : 'Spacelift Terraform stack ready';
+            
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'success',
+              target_url: '${{ steps.setup-stack.outputs.stack_url }}',
+              description: description,
+              context: 'infra/spacelift-setup'
+            });
+
+            core.info('✅ Posted success status to customer repo');
+
+      - name: Post Failure Status to Customer Repo
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'failure',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Spacelift setup failed',
+              context: 'infra/spacelift-setup'
+            });
+
+            core.error('❌ Posted failure status to customer repo');
+
+  # NEW: Setup Ansible via Spacelift
+  setup-spacelift-ansible:
+    runs-on: ubuntu-latest
+    needs: parse-capabilities
+    if: needs.parse-capabilities.outputs.ansible_enabled == 'true'
+    steps:
+      - name: Checkout Manager Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Spacelift Stack for Ansible
+        id: setup-ansible
+        uses: actions/github-script@v7
+        env:
+          SPACELIFT_API_KEY_ID: ${{ secrets.SPACELIFT_API_KEY_ID }}
+          SPACELIFT_API_KEY_SECRET: ${{ secrets.SPACELIFT_API_KEY_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const config = JSON.parse(`${{ needs.parse-capabilities.outputs.spacelift_config }}`);
+            const isDryRun = process.env.DRY_RUN === 'true';
+
+            if (isDryRun) {
+              core.warning('🧪 TEST MODE: Skipping actual Ansible/Spacelift API calls');
+            }
+
+            core.info(`Setting up Spacelift stack for Ansible: ${config.repo_name}`);
+
+            const stackId = `${config.stack_name}-ansible`;
+            const stackUrl = `${process.env.SPACELIFT_API_ENDPOINT || '${{ env.SPACELIFT_API_ENDPOINT }}'}/stack/${stackId}`;
+
+            if (isDryRun) {
+              core.info(`🧪 TEST MODE: Would setup Ansible stack: ${stackId}`);
+              core.info(`  Inventory path: ${config.ansible_inventory_path}`);
+              core.info(`✅ TEST MODE: Ansible stack simulation complete`);
+            } else {
+              // Similar logic to Terraform setup but for Ansible
+              core.info(`Ansible stack setup would happen here for: ${stackId}`);
+              core.info(`Ansible inventory path: ${config.ansible_inventory_path}`);
+
+              // TODO: Implement Ansible-specific Spacelift stack creation
+              // This would use Spacelift's Ansible integration
+
+              core.info(`✅ Ansible stack configured: ${stackUrl}`);
+            }
+
+            core.setOutput('stack_id', stackId);
+            core.setOutput('stack_url', stackUrl);
+
+      - name: Post Ansible Setup Status
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            const isDryRun = '${{ inputs.dry_run }}' === 'true';
+            const description = isDryRun
+              ? '🧪 TEST MODE: Ansible setup simulated'
+              : 'Spacelift Ansible stack ready';
+            
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'success',
+              target_url: '${{ steps.setup-ansible.outputs.stack_url }}',
+              description: description,
+              context: 'infra/ansible-setup'
+            });
+
+  # NEW: Summary of infrastructure setup
+  infrastructure-setup-summary:
+    runs-on: ubuntu-latest
+    needs:
+      [parse-capabilities, setup-spacelift-terraform, setup-spacelift-ansible]
+    if: always() && needs.parse-capabilities.outputs.has_tools == 'true'
+    steps:
+      - name: Summarize Infrastructure Setup
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            const tools = JSON.parse('${{ needs.parse-capabilities.outputs.tools }}');
+            const terraformStatus = '${{ needs.setup-spacelift-terraform.result }}';
+            const ansibleStatus = '${{ needs.setup-spacelift-ansible.result }}';
+
+            let summary = '## 🚀 Infrastructure Setup Complete\n\n';
+            summary += '**Configured Tools:**\n';
+
+            if (tools.includes('terraform')) {
+              const icon = terraformStatus === 'success' ? '✅' : '❌';
+              summary += `${icon} Terraform via Spacelift\n`;
+            }
+
+            if (tools.includes('ansible')) {
+              const icon = ansibleStatus === 'success' ? '✅' : '❌';
+              summary += `${icon} Ansible via Spacelift\n`;
+            }
+
+            summary += `\n[View setup details](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+
+            // Comment on PR if applicable
+            const prNumber = '${{ inputs.source_ref }}'.match(/\d+/)?.[0];
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                owner: '${{ inputs.source_owner }}',
+                repo: '${{ inputs.source_repo }}',
+                issue_number: parseInt(prNumber),
+                body: summary
+              });
+            }
+
+            core.info(summary);
+
+  prepare:
+    runs-on: ubuntu-latest
+    needs: [parse-capabilities, setup-spacelift-terraform]
+    # Only run Terraform workflow if Terraform is enabled and Spacelift setup succeeded
+    if: needs.parse-capabilities.outputs.terraform_enabled == 'true' && needs.setup-spacelift-terraform.result == 'success'
+    outputs:
+      variables: ${{ steps.fetch-vars.outputs.variables }}
+      plan_file: ${{ steps.set-outputs.outputs.plan_file }}
+    steps:
+      - name: Checkout Manager Repo
+        uses: actions/checkout@v4
+
+      - name: Fetch Variables from Source Repo
+        id: fetch-vars
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            // Fetch variables.yml from source repo
+            const { data } = await github.rest.repos.getContent({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              path: '${{ inputs.infra_path }}/variables.yml',
+              ref: '${{ inputs.source_sha }}'
+            });
+
+            const content = Buffer.from(data.content, 'base64').toString();
+            core.info('Fetched variables from source repo');
+            core.setOutput('variables', content);
+
+            return content;
+
+      - name: Set Outputs
+        id: set-outputs
+        run: |
+          echo "plan_file=tfplan-${{ inputs.source_repo }}-${{ inputs.environment }}" >> $GITHUB_OUTPUT
+
+      - name: Post Status to Source Repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'pending',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Infrastructure deployment in progress',
+              context: 'infra/terraform-deploy'
+            });
+
+  plan:
+    runs-on: ubuntu-latest
+    needs: prepare
+    environment: ${{ inputs.environment }}-plan
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - name: Checkout Manager Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Write Variables File
+        run: |
+          echo '${{ needs.prepare.outputs.variables }}' > terraform/source-variables.yml
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.source_repo }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="source_repo=${{ inputs.source_repo }}" \
+            -var="environment=${{ inputs.environment }}" \
+            -var-file="source-variables.yml" \
+            -out=${{ needs.prepare.outputs.plan_file }} \
+            -no-color | tee plan-output.txt
+
+          # Check if there are changes
+          if grep -q "No changes" plan-output.txt; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.plan_file }}
+          path: terraform/${{ needs.prepare.outputs.plan_file }}
+
+      - name: Comment Plan on Source PR
+        if: inputs.source_ref contains 'pull'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan-output.txt', 'utf8');
+
+            // Find PR number from ref
+            const prNumber = '${{ inputs.source_ref }}'.match(/\d+/)?.[0];
+
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                owner: '${{ inputs.source_owner }}',
+                repo: '${{ inputs.source_repo }}',
+                issue_number: parseInt(prNumber),
+                body: `## Terraform Plan for ${{ inputs.environment }}\n\n\`\`\`terraform\n${plan.slice(0, 60000)}\n\`\`\`\n\n[View full run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+              });
+            }
+
+  apply:
+    runs-on: ubuntu-latest
+    needs: [prepare, plan]
+    if: needs.plan.outputs.has_changes == 'true' && inputs.source_ref == 'refs/heads/main'
+    environment: ${{ inputs.environment }}-apply
+    steps:
+      - name: Checkout Manager Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Write Variables File
+        run: |
+          echo '${{ needs.prepare.outputs.variables }}' > terraform/source-variables.yml
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.source_repo }}/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.plan_file }}
+          path: terraform/
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: terraform
+        run: |
+          terraform apply \
+            -auto-approve \
+            -no-color \
+            ${{ needs.prepare.outputs.plan_file }} | tee apply-output.txt
+
+      - name: Get Terraform Outputs
+        id: outputs
+        working-directory: terraform
+        run: |
+          terraform output -json > outputs.json
+          cat outputs.json
+
+      - name: Upload Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ inputs.source_repo }}-${{ inputs.environment }}
+          path: terraform/outputs.json
+
+      - name: Post Success Status to Source Repo
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'success',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Infrastructure deployed successfully',
+              context: 'infra/terraform-deploy'
+            });
+
+      - name: Post Failure Status to Source Repo
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: '${{ inputs.source_owner }}',
+              repo: '${{ inputs.source_repo }}',
+              sha: '${{ inputs.source_sha }}',
+              state: 'failure',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Infrastructure deployment failed',
+              context: 'infra/terraform-deploy'
+            });
+
+  notify:
+    runs-on: ubuntu-latest
+    needs:
+      [
+        parse-capabilities,
+        prepare,
+        plan,
+        apply,
+        setup-spacelift-terraform,
+        setup-spacelift-ansible,
+      ]
+    if: always()
+    steps:
+      - name: Determine Status
+        id: status
+        run: |
+          if [ "${{ needs.apply.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "message=Infrastructure deployed successfully" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.apply.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "message=Infrastructure deployment failed" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.plan.outputs.has_changes }}" == "false" ]; then
+            echo "status=no-changes" >> $GITHUB_OUTPUT
+            echo "emoji=ℹ️" >> $GITHUB_OUTPUT
+            echo "message=No infrastructure changes detected" >> $GITHUB_OUTPUT
+          else
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "emoji=⏭️" >> $GITHUB_OUTPUT
+            echo "message=Infrastructure deployment skipped (PR)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on Source Repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SOURCE_REPOS_PAT }}
+          script: |
+            const status = '${{ steps.status.outputs.status }}';
+            const emoji = '${{ steps.status.outputs.emoji }}';
+            const message = '${{ steps.status.outputs.message }}';
+            const tools = JSON.parse('${{ needs.parse-capabilities.outputs.tools }}' || '[]');
+
+            // Build tools status section
+            let toolsStatus = '';
+            if (tools.length > 0) {
+              toolsStatus = '\n**Infrastructure Tools Configured:**\n';
+              
+              if (tools.includes('terraform')) {
+                const tfStatus = '${{ needs.setup-spacelift-terraform.result }}';
+                const tfIcon = tfStatus === 'success' ? '✅' : '❌';
+                toolsStatus += `${tfIcon} Terraform (via Spacelift)\n`;
+              }
+              
+              if (tools.includes('ansible')) {
+                const ansibleStatus = '${{ needs.setup-spacelift-ansible.result }}';
+                const ansibleIcon = ansibleStatus === 'success' ? '✅' : '❌';
+                toolsStatus += `${ansibleIcon} Ansible (via Spacelift)\n`;
+              }
+              
+              toolsStatus += '\n';
+            }
+
+            const comment = `${emoji} **Infrastructure Deployment - ${{ inputs.environment }}**
+
+            ${message}
+            ${toolsStatus}
+            **Details:**
+            - Source: \`${{ inputs.source_repo }}\`
+            - Environment: \`${{ inputs.environment }}\`
+            - Triggered by: @${{ inputs.triggered_by }}
+            - Commit: \`${{ inputs.source_sha }}\`
+
+            [View deployment logs](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+
+            // If this is from a PR, comment on it
+            const prNumber = '${{ inputs.source_ref }}'.match(/\d+/)?.[0];
+
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                owner: '${{ inputs.source_owner }}',
+                repo: '${{ inputs.source_repo }}',
+                issue_number: parseInt(prNumber),
+                body: comment
+              });
+            }

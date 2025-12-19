@@ -1,0 +1,28 @@
+{
+  "name": "custom-property-tools",
+  "version": "1.0.0",
+  "description": "GitHub Custom Properties management and sync tools",
+  "main": "sync-properties.js",
+  "scripts": {
+    "sync": "node sync-properties.js",
+    "sync:dry-run": "node sync-properties.js --dry-run",
+    "sync:billing": "node sync-properties.js --source billing-api --property customer_tier",
+    "sync:teams": "node sync-properties.js --source github-teams --property team_owner",
+    "sync:all": "node sync-properties.js --source all"
+  },
+  "keywords": [
+    "github",
+    "custom-properties",
+    "compliance",
+    "automation"
+  ],
+  "author": "Service Provider",
+  "license": "MIT",
+  "dependencies": {
+    "@octokit/rest": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+

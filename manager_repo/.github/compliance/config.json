@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "description": "Custom Property Compliance Configuration",
+  "required_properties": [
+    "repo_content_type",
+    "team_owner"
+  ],
+  "required_for_infra_repos": [
+    "infrastructure_tools",
+    "customer_tier"
+  ],
+  "optional_properties": [
+    "terraform_version",
+    "spacelift_auto_deploy",
+    "infrastructure_approval_required",
+    "ansible_inventory_path",
+    "spacelift_stack_name",
+    "billing_account",
+    "security_contact",
+    "region_restriction"
+  ],
+  "valid_values": {
+    "repo_content_type": ["app", "infra"],
+    "customer_tier": ["free", "startup", "professional", "enterprise"],
+    "infrastructure_tools": [
+      "terraform",
+      "ansible",
+      "pulumi",
+      "cloudformation",
+      "crossplane"
+    ],
+    "terraform_version": ["1.5", "1.6", "1.7", "1.8", "latest"],
+    "region_restriction": ["us-only", "eu-only", "apac-only", "global"]
+  },
+  "auto_remediate": {
+    "team_owner": true,
+    "missing_optional": false,
+    "missing_required": false,
+    "invalid_value": false,
+    "content_type_add_detected": true,
+    "content_type_remove_missing": false
+  },
+  "content_detection_rules": {
+    "infra_indicators": [
+      "infra",
+      "terraform",
+      "ansible",
+      "kubernetes",
+      "k8s",
+      "helm",
+      "cloudformation",
+      "pulumi"
+    ],
+    "app_indicators": [
+      "app",
+      "src",
+      "frontend",
+      "backend",
+      "services",
+      "packages",
+      "lib",
+      "components"
+    ],
+    "check_file_extensions": true,
+    "infra_file_patterns": [".tf", ".tfvars", "ansible.cfg", "playbook.yml"]
+  },
+  "severity_rules": {
+    "missing_required": "high",
+    "missing_optional": "low",
+    "invalid_value": "high",
+    "invalid_team": "critical",
+    "team_mismatch": "medium",
+    "stale_property": "low",
+    "deprecated_value": "medium",
+    "content_type_mismatch_add": "high",
+    "content_type_mismatch_remove": "medium"
+  },
+  "team_mappings": {
+    "_comment": "Map old team names to new team names (for team renames)",
+    "old-platform-team": "infrastructure-team",
+    "old-devops-team": "sre-team"
+  },
+  "repository_exclusions": [
+    ".github",
+    "archived-*",
+    "template-*"
+  ],
+  "notification_config": {
+    "slack_webhook_url": "",
+    "email_recipients": [],
+    "severity_threshold": "high"
+  }
+}
+

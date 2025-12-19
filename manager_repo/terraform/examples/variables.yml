@@ -1,0 +1,121 @@
+# Example variables file for source repositories
+# Copy this to your source repo at: infra/variables.yml
+
+# Project Configuration
+project_name: my-application
+cloud_provider: aws
+
+# Environment-Specific Configuration
+environments:
+  staging:
+    region: us-east-1
+    instance_type: t3.micro
+    min_instances: 1
+    max_instances: 2
+    enable_monitoring: false
+    backup_retention_days: 7
+    
+  production:
+    region: us-west-2
+    instance_type: t3.small
+    min_instances: 2
+    max_instances: 10
+    enable_monitoring: true
+    backup_retention_days: 30
+
+# Networking Configuration
+networking:
+  vpc_cidr: "10.0.0.0/16"
+  availability_zones: 2
+  enable_nat_gateway: true
+  enable_vpn: false
+
+# Compute Configuration (optional)
+compute:
+  instance_type: t3.micro
+  ami_id: ami-0c55b159cbfafe1f0  # Amazon Linux 2
+  key_name: my-key-pair
+  user_data_script: |
+    #!/bin/bash
+    yum update -y
+    yum install -y docker
+
+# Database Configuration (optional)
+database:
+  engine: postgres
+  engine_version: "15.3"
+  instance_class: db.t3.micro
+  allocated_storage: 20
+  backup_retention_period: 7
+  multi_az: false
+
+# Storage Configuration (optional)
+storage:
+  bucket_name: my-app-storage
+  versioning_enabled: true
+  lifecycle_rules:
+    - name: expire-old-versions
+      enabled: true
+      expiration_days: 90
+
+# Monitoring Configuration (optional)
+monitoring:
+  enable_cloudwatch: true
+  enable_xray: false
+  log_retention_days: 14
+  alarm_email: ops@example.com
+
+# Security Configuration (optional)
+security:
+  enable_waf: false
+  enable_shield: false
+  allowed_cidr_blocks:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+  ssl_certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+# Tags (will be applied to all resources)
+tags:
+  managed_by: manager-repo
+  team: platform
+  cost_center: engineering
+  project: my-application
+  environment: "{{ environment }}"  # Will be replaced with actual environment
+
+# Feature Flags (optional)
+features:
+  enable_cdn: false
+  enable_cache: true
+  enable_queue: false
+  enable_search: false
+
+# Scaling Configuration (optional)
+scaling:
+  cpu_threshold: 70
+  memory_threshold: 80
+  scale_up_cooldown: 300
+  scale_down_cooldown: 300
+
+# Backup Configuration (optional)
+backup:
+  enabled: true
+  schedule: "cron(0 2 * * ? *)"  # 2 AM daily
+  retention_days: 30
+  cross_region_copy: false
+
+# Notification Configuration (optional)
+notifications:
+  slack_webhook: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+  email_list:
+    - ops@example.com
+    - dev@example.com
+  enable_pagerduty: false
+
+# Custom Configuration (optional)
+# Add any custom fields your infrastructure needs
+custom:
+  api_domain: api.example.com
+  web_domain: www.example.com
+  enable_worker_nodes: true
+  worker_count: 2
+
